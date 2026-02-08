@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# data artifacts
+*.csv
+*.parquet
+*.pkl
+
+# notebooks junk
+.ipynb_checkpoints/
+
+# python junk
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
