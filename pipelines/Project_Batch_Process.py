@@ -13,8 +13,6 @@ from pipelines.transformations import transform_bronze_to_silver
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def main():
-    storage_options = get_s3_storage_options()
-
     fs = s3fs.S3FileSystem(
         key=S3_ACCESS_KEY,
         secret=S3_SECRET_KEY,
