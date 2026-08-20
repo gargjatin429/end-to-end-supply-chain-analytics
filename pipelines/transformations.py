@@ -1,14 +1,12 @@
 import polars as pl
-from config import DIM_GEO_PATH, DIM_CUST_PATH, DIM_PROD_PATH
+from config import DIM_GEO_PATH, DIM_CUST_PATH, DIM_PROD_PATH, get_s3_storage_options
 
 def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
     """
     Transforms raw Bronze data into curated Silver data.
     """
-    # --------------------------------------------------------------------------
-    # STEP 2: DATA VALIDATION & CLEANUP
-    # --------------------------------------------------------------------------
-    # Validate dates first to avoid propagating invalid records downstream
+    storage_options = get_s3_storage_options()
+
     df = (
         df
         .with_columns(
@@ -26,16 +24,12 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
 
     df = df.unique(maintain_order=True)
 
-    # Remove helper and unused source columns
     df = df.drop([
         "order_dayofweek",
         "valid_date_check",
         "shipping_mode"
     ])
 
-    # --------------------------------------------------------------------------
-    # STEP 3: FINANCIAL METRIC DERIVATION (P&L FOUNDATION)
-    # --------------------------------------------------------------------------
     df = (
         df
         .with_columns([
@@ -61,9 +55,6 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
         ])
     )
 
-    # --------------------------------------------------------------------------
-    # STEP 4: OPERATIONAL & STRATEGIC FEATURES
-    # --------------------------------------------------------------------------
     df = (
         df
         .with_columns([
@@ -90,7 +81,6 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
         ])
     )
 
-    # Categorical segmentation for analysis
     df = df.with_columns([
         pl.when(pl.col("shipping_delta") < 0).then(pl.lit("Early"))
           .when(pl.col("shipping_delta") == 0).then(pl.lit("On Time"))
@@ -136,9 +126,6 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
         ).alias("trade_route")
     ])
 
-    # --------------------------------------------------------------------------
-    # STEP 5: CONTEXTUAL WINDOW METRICS
-    # --------------------------------------------------------------------------
     df = (
         df
         .with_columns([
@@ -161,12 +148,9 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
         ])
     )
 
-    # --------------------------------------------------------------------------
-    # STEP 6: STAR SCHEMA ENRICHMENT
-    # --------------------------------------------------------------------------
-    dim_geo = pl.read_parquet(DIM_GEO_PATH)
-    dim_cust = pl.read_parquet(DIM_CUST_PATH)
-    dim_prod = pl.read_parquet(DIM_PROD_PATH)
+    dim_geo = pl.read_parquet(DIM_GEO_PATH, storage_options=storage_options)
+    dim_cust = pl.read_parquet(DIM_CUST_PATH, storage_options=storage_options)
+    dim_prod = pl.read_parquet(DIM_PROD_PATH, storage_options=storage_options)
 
     df = (
         df
@@ -184,15 +168,10 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
         .drop(["product_name", "category_name", "department_name"])
     )
 
-    # --------------------------------------------------------------------------
-    # STEP 7: FINAL SORT
-    # --------------------------------------------------------------------------
-    # Sorting ensures stable downstream clustered indexing in SQL
     df = df.sort(
         ["order_year", "order_month", "order_day", "order_item_quantity"]
     )
 
-    # Normalize column naming
     df = df.rename({col: col.lower() for col in df.columns})
 
     return df

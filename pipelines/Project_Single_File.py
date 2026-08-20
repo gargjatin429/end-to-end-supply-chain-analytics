@@ -1,56 +1,65 @@
 import polars as pl
-import shutil
+import s3fs
 import os
 import logging
 from datetime import datetime
 import sys
 
-# Add the project root to the python path to import config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import BRONZE_DIR, SILVER_DIR, ARCHIVE_DIR, ensure_directories
+from config import BRONZE_DIR, SILVER_DIR, ARCHIVE_DIR, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
 from pipelines.transformations import transform_bronze_to_silver
 
-# Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def main():
-    ensure_directories()
+    storage_options = get_s3_storage_options()
 
-    # Source file (Bronze Layer)
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+    )
+
     source_file_name = "DataCo_Final_2M.csv"
-    source_file_path = os.path.join(BRONZE_DIR, source_file_name)
+    source_file_path = f"{BRONZE_DIR}/{source_file_name}"
 
-    # Target output (Silver Layer)
     target_file_name = "DataCo_Silver.parquet"
-    target_file_path = os.path.join(SILVER_DIR, target_file_name)
+    target_file_path = f"{SILVER_DIR}/{target_file_name}"
 
-    if not os.path.exists(source_file_path):
+    if not fs.exists(source_file_path.replace("s3://", "")):
         logging.error(f"Source file not found: {source_file_path}")
         return
 
     logging.info(f"Starting single-file pipeline for: {source_file_name}")
 
     try:
-        # STEP 1: LOAD (Extract)
-        df = pl.read_csv(source_file_path, encoding="cp1252")
+        # STEP 1: LOAD
+        with fs.open(source_file_path, 'rb') as f:
+            df = pl.read_csv(f, encoding="cp1252")
+
         logging.info(f"Original row count: {df.height}")
 
         # STEP 2-7: TRANSFORMATIONS
         df_silver = transform_bronze_to_silver(df)
 
         # STEP 7: WRITE
-        df_silver.write_parquet(target_file_path)
+        with fs.open(target_file_path, 'wb') as f:
+            df_silver.write_parquet(f)
+
         logging.info(f"Processed file saved to: {target_file_path}")
         logging.info(f"Final row count: {df_silver.height}")
 
-        # STEP 8: ARCHIVAL (IDEMPOTENCY)
+        # STEP 8: ARCHIVAL
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name, ext = os.path.splitext(source_file_name)
         archive_name = f"{name}_{timestamp}{ext}"
-        archive_path = os.path.join(ARCHIVE_DIR, archive_name)
+        archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-        shutil.move(source_file_path, archive_path)
+        # Move file in S3
+        fs.copy(source_file_path.replace("s3://", ""), archive_path.replace("s3://", ""))
+        fs.rm(source_file_path.replace("s3://", ""))
+
         logging.info(f"Archived source file as: {archive_path}")
 
     except Exception as e:
