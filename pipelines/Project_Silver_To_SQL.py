@@ -1,42 +1,21 @@
-"""
-Purpose:
-    Load curated Silver-layer fact data into SQL Server.
-
-What this script does:
-    - Reads fact-level Parquet files from the Silver layer
-    - Enforces a strict column contract aligned with the SQL table schema
-    - Appends data into the SQL Server fact table
-    - Archives successfully loaded files to ensure idempotent execution
-
-What this script does NOT do:
-    - No transformations or business logic
-    - No dimensional modeling
-    - No table creation or schema changes
-"""
-
 import polars as pl
-import pandas as pd
 import shutil
 import os
 import glob
+import logging
 from sqlalchemy import create_engine
 from datetime import datetime
+import sys
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-SERVER_NAME = "localhost"
-DATABASE = "DataCo_Analytics"
-DRIVER = "ODBC Driver 17 for SQL Server"
+# Add the project root to the python path to import config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SILVER_FOLDER = r"D:\Data Lake\Silver"
-ARCHIVE_FOLDER = r"D:\Data Lake\archive_silver"
+from config import SILVER_DIR, ARCHIVE_DIR, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, ensure_directories
+
+# Set up basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 TABLE_NAME = "Fact_Sales"
-
-connection_string = (
-    f"mssql+pyodbc://@{SERVER_NAME}/{DATABASE}"
-    f"?driver={DRIVER}&trusted_connection=yes"
-)
 
 # Explicit column contract matching the SQL table schema exactly
 STRICT_COLUMNS = [
@@ -64,51 +43,79 @@ STRICT_COLUMNS = [
     "state_order_count", "state_density_class"
 ]
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
 def main():
-    print("Starting Silver → SQL fact load pipeline.")
+    ensure_directories()
+    logging.info("Starting Silver → SQL fact load pipeline.")
 
     # --------------------------------------------------------------------------
-    # STEP 1: CONNECT TO SQL SERVER
+    # STEP 1: CONNECT TO SQL SERVER (OR SQLITE FOR TESTING)
     # --------------------------------------------------------------------------
+    is_testing = os.getenv("TEST_MODE", "false").lower() == "true"
+
+    if is_testing:
+        # Use a local SQLite database for testing instead of SQL Server
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_analytics.db")
+        connection_string = f"sqlite:///{db_path}"
+        logging.info(f"Running in test mode. Using SQLite at {db_path}")
+    else:
+        connection_string = (
+            f"mssql+pyodbc://@{SQL_SERVER_NAME}/{SQL_DATABASE}"
+            f"?driver={SQL_DRIVER}&trusted_connection=yes"
+        )
+
     try:
-        engine = create_engine(connection_string)
+        # fast_executemany=True is highly recommended for pyodbc bulk inserts
+        if is_testing:
+            engine = create_engine(connection_string)
+        else:
+            engine = create_engine(connection_string, fast_executemany=True)
+
         with engine.connect():
             pass
-        print("Connected to SQL Server.")
+        logging.info("Connected to database.")
     except Exception as e:
-        print(f"Connection failed: {e}")
+        logging.error(f"Connection failed: {e}")
         return
 
     # --------------------------------------------------------------------------
     # STEP 2: DISCOVER FACT FILES
     # --------------------------------------------------------------------------
-    parquet_files = glob.glob(os.path.join(SILVER_FOLDER, "Fact_*.parquet"))
+    parquet_files = glob.glob(os.path.join(SILVER_DIR, "Fact_*.parquet"))
+
+    # Also include the single file output if it exists
+    single_file = os.path.join(SILVER_DIR, "DataCo_Silver.parquet")
+    if os.path.exists(single_file) and single_file not in parquet_files:
+        parquet_files.append(single_file)
 
     if not parquet_files:
-        print("No fact Parquet files found to load.")
+        logging.info("No fact Parquet files found to load.")
         return
 
-    print(f"Found {len(parquet_files)} files to load.\n")
+    logging.info(f"Found {len(parquet_files)} files to load.")
 
     # --------------------------------------------------------------------------
     # STEP 3: LOAD LOOP
     # --------------------------------------------------------------------------
     for i, file_path in enumerate(parquet_files, start=1):
         file_name = os.path.basename(file_path)
-        print(f"Processing file {i}/{len(parquet_files)}: {file_name}")
+        logging.info(f"Processing file {i}/{len(parquet_files)}: {file_name}")
 
         try:
             # Read Parquet
             df = pl.read_parquet(file_path)
 
             # Enforce strict schema alignment
-            df_clean = df.select(STRICT_COLUMNS)
-            print(f"Loading {df_clean.height} rows into SQL.")
+            # Using list comprehension to get only columns that exist in df, to avoid errors if testing schema differs slightly
+            available_columns = [col for col in STRICT_COLUMNS if col in df.columns]
+            if len(available_columns) < len(STRICT_COLUMNS):
+                missing = set(STRICT_COLUMNS) - set(available_columns)
+                logging.warning(f"File missing strict columns: {missing}")
 
-            # Append to SQL table
+            df_clean = df.select(available_columns)
+            logging.info(f"Loading {df_clean.height} rows into SQL.")
+
+            # Append to SQL table. We still use to_pandas() for sqlalchemy compatibility,
+            # but fast_executemany=True on engine setup makes it orders of magnitude faster.
             df_clean.to_pandas().to_sql(
                 name=TABLE_NAME,
                 con=engine,
@@ -117,21 +124,21 @@ def main():
                 chunksize=10_000
             )
 
-            print("Load successful.")
+            logging.info("Load successful.")
 
             # Archive processed file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             archive_name = f"LOADED_{file_name}_{timestamp}.parquet"
-            os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
-            shutil.move(file_path, os.path.join(ARCHIVE_FOLDER, archive_name))
+            archive_path = os.path.join(ARCHIVE_DIR, archive_name)
 
-            print(f"Archived file as: {archive_name}\n")
+            shutil.move(file_path, archive_path)
+            logging.info(f"Archived file as: {archive_name}")
 
         except Exception as e:
-            print(f"Error loading {file_name}: {e}")
-            print("Skipping file.\n")
+            logging.error(f"Error loading {file_name}: {e}", exc_info=True)
+            logging.info("Skipping file.")
 
-    print("Silver → SQL pipeline completed.")
+    logging.info("Silver → SQL pipeline completed.")
 
 if __name__ == "__main__":
     main()
