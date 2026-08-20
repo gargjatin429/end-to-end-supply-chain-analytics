@@ -1,13 +1,251 @@
-# End-to-End Pipeline Walkthrough & Brutal Review
+# End-to-End Pipeline Walkthrough & Code Review (V2)
 
-This document breaks down the entire supply chain analytical pipeline step by step. For each step, it includes an explanation, the full source code used, and a brutally honest critique for engineering improvements.
+This document breaks down the entire supply chain analytical pipeline step by step, following the recent architectural refactoring. For each step, it includes an explanation, the full source code used, and a review/critique for potential future improvements.
 
 ---
 
-## Step 1: Raw Data Cleaning (Local Preparation)
+## Step 1: Configuration Management
 
 **Explanation:**
-Before any synthetic data generation can occur, the raw Kaggle dataset must be cleaned. This step normalizes text encodings, drops unused columns, and fixes date parsing issues to ensure the resulting CSV is stable enough for the SDV model to ingest without crashing.
+The project now uses a centralized configuration file to manage environment variables, S3 endpoints (for MinIO), and SQL Server connection strings. This removes hardcoded paths and credentials from the pipeline scripts.
+
+**Code (`config.py`):**
+```python
+import os
+
+# S3 Configuration
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "admin")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "password")
+
+# S3 Buckets / Paths
+BRONZE_DIR = "s3://data-lake/bronze"
+SILVER_DIR = "s3://data-lake/silver"
+ARCHIVE_DIR = "s3://data-lake/archive"
+
+# Dimension Files
+DIM_GEO_PATH = f"{SILVER_DIR}/dim_geo.parquet"
+DIM_CUST_PATH = f"{SILVER_DIR}/Dim_Customer_Geo.parquet"
+DIM_PROD_PATH = f"{SILVER_DIR}/Dim_Product.parquet"
+
+# SQL Server Configuration (defaults can be overridden via environment variables)
+SQL_SERVER_NAME = os.getenv("SQL_SERVER_NAME", "localhost")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "DataCo_Analytics")
+SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+
+# Helper for Polars S3 kwargs
+def get_s3_storage_options():
+    return {
+        "endpoint_url": S3_ENDPOINT_URL,
+        "aws_access_key_id": S3_ACCESS_KEY,
+        "aws_secret_access_key": S3_SECRET_KEY,
+    }
+
+```
+
+**Critique & Improvements:**
+- **Improvement:** Great step forward moving away from hardcoded strings. Using `os.getenv()` provides flexibility.
+- **Nitpick:** The default S3 credentials (`admin`/`password`) in source control could still be risky if accidentally deployed. Using a dedicated library like `pydantic-settings` or `python-dotenv` for config management is often more robust in larger projects.
+
+---
+
+## Step 2: Reusable Data Transformations (DRY Principle)
+
+**Explanation:**
+To resolve the massive code duplication between the single-file and batch pipelines, all the core Polars data cleaning and transformation logic was abstracted into a shared module.
+
+**Code (`pipelines/transformations.py`):**
+```python
+import polars as pl
+from config import DIM_GEO_PATH, DIM_CUST_PATH, DIM_PROD_PATH, get_s3_storage_options
+
+def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Transforms raw Bronze data into curated Silver data.
+    """
+    storage_options = get_s3_storage_options()
+
+    df = (
+        df
+        .with_columns(
+            pl.format(
+                "{}-{}-{}",
+                pl.col("order_year"),
+                pl.col("order_month"),
+                pl.col("order_day")
+            )
+            .str.to_date("%Y-%m-%d", strict=False)
+            .alias("valid_date_check")
+        )
+        .filter(pl.col("valid_date_check").is_not_null())
+    )
+
+    df = df.unique(maintain_order=True)
+
+    df = df.drop([
+        "order_dayofweek",
+        "valid_date_check",
+        "shipping_mode"
+    ])
+
+    df = (
+        df
+        .with_columns([
+            (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
+            .alias("gross_sales"),
+
+            (
+                (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
+                * pl.col("order_item_discount_rate")
+            ).alias("discount_amount")
+        ])
+        .with_columns([
+            (pl.col("gross_sales") - pl.col("discount_amount"))
+            .alias("net_revenue")
+        ])
+        .with_columns([
+            (pl.col("net_revenue") * pl.col("order_item_profit_ratio"))
+            .alias("order_profit_amount")
+        ])
+        .with_columns([
+            (pl.col("net_revenue") - pl.col("order_profit_amount"))
+            .alias("total_cost")
+        ])
+    )
+
+    df = (
+        df
+        .with_columns([
+            (pl.col("total_cost") / pl.col("order_item_quantity"))
+            .alias("actual_unit_cost"),
+
+            (pl.col("order_profit_amount") < 0)
+            .alias("is_profit_bleeder"),
+
+            (pl.col("days_for_shipping_real")
+             - pl.col("days_for_shipment_scheduled"))
+            .alias("shipping_delta")
+        ])
+        .with_columns([
+            (
+                (pl.col("order_item_product_price") - pl.col("actual_unit_cost"))
+                / pl.col("actual_unit_cost")
+            ).alias("markup_pct"),
+
+            (
+                pl.col("discount_amount")
+                / (pl.col("order_profit_amount") + pl.col("discount_amount"))
+            ).fill_nan(0.0).alias("margin_leakage_pct")
+        ])
+    )
+
+    df = df.with_columns([
+        pl.when(pl.col("shipping_delta") < 0).then(pl.lit("Early"))
+          .when(pl.col("shipping_delta") == 0).then(pl.lit("On Time"))
+          .otherwise(pl.lit("Late"))
+          .alias("delivery_class"),
+
+        pl.when(pl.col("days_for_shipment_scheduled") == 0).then(pl.lit("Same Day"))
+          .when(pl.col("days_for_shipment_scheduled") <= 2).then(pl.lit("First Class"))
+          .when(pl.col("days_for_shipment_scheduled") == 3).then(pl.lit("Second Class"))
+          .otherwise(pl.lit("Standard Class"))
+          .alias("shipping_mode_clean"),
+
+        pl.date(
+            pl.col("order_year"),
+            pl.col("order_month"),
+            pl.col("order_day")
+        ).dt.strftime("%A").alias("day_name_str"),
+
+        pl.when(
+            pl.date(
+                pl.col("order_year"),
+                pl.col("order_month"),
+                pl.col("order_day")
+            )
+            .dt.strftime("%A")
+            .is_in(["Saturday", "Sunday"])
+        )
+        .then(pl.lit("Weekend"))
+        .otherwise(pl.lit("Weekday"))
+        .alias("order_day_type"),
+
+        pl.when(pl.col("order_item_product_price") < 60).then(pl.lit("Budget"))
+          .when(pl.col("order_item_product_price") <= 250).then(pl.lit("Mainstream"))
+          .otherwise(pl.lit("Premium"))
+          .alias("price_segment"),
+
+        (
+            pl.col("customer_country").str.replace("EE. UU.", "USA")
+            + "_"
+            + pl.col("customer_state")
+            + " -> "
+            + pl.col("order_country")
+        ).alias("trade_route")
+    ])
+
+    df = (
+        df
+        .with_columns([
+            (pl.col("gross_sales")
+             / pl.col("gross_sales").sum().over("category_name"))
+            .alias("category_share_pct"),
+
+            pl.col("order_state").count().over("order_state")
+            .alias("state_order_count"),
+
+            (pl.col("gross_sales")
+             / pl.col("gross_sales").sum().over("market"))
+            .alias("market_share_pct")
+        ])
+        .with_columns([
+            pl.when(pl.col("state_order_count") > 100).then(pl.lit("Strategic Hub"))
+              .when(pl.col("state_order_count") < 10).then(pl.lit("Expansion Zone"))
+              .otherwise(pl.lit("Standard Zone"))
+              .alias("state_density_class")
+        ])
+    )
+
+    dim_geo = pl.read_parquet(DIM_GEO_PATH, storage_options=storage_options)
+    dim_cust = pl.read_parquet(DIM_CUST_PATH, storage_options=storage_options)
+    dim_prod = pl.read_parquet(DIM_PROD_PATH, storage_options=storage_options)
+
+    df = (
+        df
+        .join(dim_geo,
+              on=["order_state", "order_country", "order_region", "market"],
+              how="left")
+        .drop(["order_state", "order_country", "order_region", "market"])
+        .join(dim_cust,
+              on=["customer_state", "customer_country"],
+              how="left")
+        .drop(["customer_state", "customer_country"])
+        .join(dim_prod,
+              on=["product_name", "category_name", "department_name"],
+              how="left")
+        .drop(["product_name", "category_name", "department_name"])
+    )
+
+    df = df.sort(
+        ["order_year", "order_month", "order_day", "order_item_quantity"]
+    )
+
+    df = df.rename({col: col.lower() for col in df.columns})
+
+    return df
+
+```
+
+**Critique & Improvements:**
+- **Improvement:** Excellent refactor. This makes the code significantly easier to test, maintain, and version control. You can now write unit tests specifically for `transform_bronze_to_silver`.
+- **Nitpick:** The function is quite long (170+ lines). In the future, this could be broken down further into smaller, composable functions (e.g., `clean_dates()`, `calculate_financials()`, `join_dimensions()`).
+
+---
+
+## Step 3: Raw Data Cleaning & Data Scaling (Colab / Local Notebooks)
+
+**Explanation:**
+The raw Kaggle dataset must be cleaned to normalize text encodings and fix date parsing issues before SDV model training. The cleaned data is then fed into SDV (CTGAN) on Google Colab to generate synthetic rows.
 
 **Code (`data_scaling/Project_CSV_Clean_For_SDV_Colab.ipynb` extracted code):**
 ```python
@@ -310,18 +548,6 @@ df2.write_csv(output_path, separator=",")
 
 print(f"Final dataset saved to: {output_path}")
 ```
-
-**Brutal Critique & Improvements:**
-- **Notebooks are not for ETL:** Using a Jupyter Notebook for mandatory pre-processing is an anti-pattern. This should be a version-controlled Python script (`.py`) that can be executed from a command line or orchestrator.
-- **Manual Execution:** The user has to manually open this notebook and run cells. This breaks automation.
-- **Hardcoded Paths:** Any file paths in here are likely hardcoded, making it difficult for someone else to run it on their machine.
-
----
-
-## Step 2: Synthetic Data Scaling (Colab)
-
-**Explanation:**
-This step takes the cleaned CSV, uploads it to Google Colab, and uses the Synthetic Data Vault (SDV) CTGAN model to generate roughly 2 million synthetic rows. This allows the local pipeline and SQL warehouse to be stress-tested with volumes that exceed Excel's capacity, while circumventing local GPU limitations.
 
 **Code (`data_scaling/Project_Colab_NB.ipynb` extracted code):**
 ```python
@@ -673,17 +899,15 @@ print("Generation process finished.")
 
 ```
 
-**Brutal Critique & Improvements:**
-- **Disconnected Process:** Moving data manually to Colab, running a notebook, downloading the data, and putting it back into the local pipeline completely severs the automated flow.
-- **Reproducibility:** There is no specific environment/dependency file (`requirements.txt`) attached to this project, meaning if SDV updates its API, this notebook will break for future users.
-- **Security / Data Movement:** Uploading local data to a free-tier cloud service and bringing it back is generally frowned upon in enterprise environments due to data governance and egress issues.
+**Critique & Improvements:**
+- **Critique:** The notebooks still remain isolated from the automated pipeline. While acceptable for a one-off modeling task, in a production ML-ops environment, the training and inference steps would be containerized and orchestrated alongside the data pipelines, rather than run manually in Colab.
 
 ---
 
-## Step 3: Analytical Database Initialization (SQL)
+## Step 4: Analytical Database Initialization (SQL)
 
 **Explanation:**
-The data warehouse needs to be set up before any data is loaded. These scripts create the `DataCo_Analytics` database, the dimension tables (`Dim_Geo`, `Dim_Customer_Geo`, `Dim_Product`), and the central `Fact_Sales` table with foreign key constraints. It also includes an optimization to persist a constructed date column.
+These scripts set up the data warehouse structure (`DataCo_Analytics`), create dimension/fact tables with foreign key constraints, and add a persisted computed column.
 
 **Code (`sql/01_Database_&_Tables_Creation.sql`):**
 ```sql
@@ -829,705 +1053,273 @@ GO
 
 ```
 
-**Brutal Critique & Improvements:**
-- **Lack of Schemas:** Everything is created in the default `dbo` schema. In a real data warehouse, you should separate layers (e.g., `stg` for staging, `core` or `edw` for dimensions and facts).
-- **Poor Indexing Strategy:** While the `order_id` primary key has a clustered index, there are no non-clustered indexes on the foreign keys (`geo_id`, `product_key`) or filtering columns (dates, statuses). Analytical queries on a 2-million-row fact table will suffer from massive table scans.
-- **Identity on Fact Table:** Using an `IDENTITY` column as a primary key on a fact table populated by external pipelines can lead to mismatched IDs if pipelines are re-run or backfilled, as the order of insertion isn't guaranteed.
+**Critique & Improvements:**
+- **Critique:** The SQL schemas still exist in the default `dbo` namespace, and the indexing strategy (only a PK clustered index) remains unoptimized for heavy analytical query patterns. Consider adding columnstore indexes for the Fact table since this is analytical data.
 
 ---
 
-## Step 4: Bronze to Silver Processing (Batch Pipeline)
+## Step 5: Bronze to Silver Processing (Pipelines)
 
 **Explanation:**
-This script represents the core transformation engine. It reads raw Bronze CSV files, cleans the data, calculates financial and operational metrics (like `is_profit_bleeder`, `markup_pct`), joins pre-cleaned dimension tables to form a star schema, and outputs optimized Parquet files into the Silver layer. It also archives the source files for idempotency.
+These scripts orchestrate the ingestion of raw data from the Bronze layer (now reading from S3/MinIO), apply the shared transformation logic, and write Parquet files to the Silver layer. It includes proper logging and archival steps.
 
 **Code (`pipelines/Project_Batch_Process.py`):**
 ```python
-"""
-Purpose:
-    Batch Bronze → Silver processing pipeline for supply chain data.
-
-What this script does:
-    - Reads raw CSV files from the Bronze layer
-    - Cleans and validates records (dates, duplicates, schema issues)
-    - Derives financial, operational, and strategic analytical fields
-    - Joins curated dimension tables to form a star-schema-ready fact dataset
-    - Writes cleaned Parquet files to the Silver layer
-    - Archives processed source files to ensure idempotent re-runs
-
-What this script does NOT do:
-    - No model training or synthetic data generation
-    - No SQL loading or BI logic
-    - No production orchestration or scheduling
-"""
-
 import polars as pl
-import shutil
+import s3fs
 import os
-import glob
+import logging
 from datetime import datetime
+import sys
 
-# ==============================================================================
-# CONFIGURATION & PATHS
-# ==============================================================================
-# Data Lake Zones
-bronze_folder_path = r"D:\Data Lake\Bronze"
-silver_folder_path = r"D:\Data Lake\Silver"
-archive_folder_path = r"D:\Data Lake\Archive"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Dimension Tables (pre-cleaned, static Parquet files)
-dim_geo_path = r"D:\Data Lake\Silver\dim_geo.parquet"
-dim_cust_path = r"D:\Data Lake\Silver\Dim_Customer_Geo.parquet"
-dim_prod_path = r"D:\Data Lake\Silver\Dim_Product.parquet"
+from config import BRONZE_DIR, SILVER_DIR, ARCHIVE_DIR, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+from pipelines.transformations import transform_bronze_to_silver
 
-# ==============================================================================
-# PHASE 1: DISCOVERY
-# ==============================================================================
-# Identify all CSV files present in the Bronze layer
-csv_files = glob.glob(os.path.join(bronze_folder_path, "*.csv"))
-print(f"Found {len(csv_files)} files to process.\n")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==============================================================================
-# PHASE 2: BATCH PROCESSING
-# ==============================================================================
-for i, file_path in enumerate(csv_files, start=1):
+def main():
+    storage_options = get_s3_storage_options()
 
-    file_name = os.path.basename(file_path)
-    print(f"Processing file {i}/{len(csv_files)}: {file_name}")
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+    )
 
-    try:
-        # ----------------------------------------------------------------------
-        # STEP 1: LOAD (Extract)
-        # ----------------------------------------------------------------------
-        df = pl.read_csv(file_path, encoding="cp1252")
+    # PHASE 1: DISCOVERY
+    # Remove the s3:// prefix for s3fs globbing
+    bronze_path_no_scheme = BRONZE_DIR.replace("s3://", "")
+    csv_files = fs.glob(f"{bronze_path_no_scheme}/*.csv")
 
-        # ----------------------------------------------------------------------
-        # STEP 2: DATA VALIDATION & CLEANUP
-        # ----------------------------------------------------------------------
-        # Validate dates first to avoid propagating invalid records downstream
-        df = (
-            df
-            .with_columns(
-                pl.format(
-                    "{}-{}-{}",
-                    pl.col("order_year"),
-                    pl.col("order_month"),
-                    pl.col("order_day")
-                )
-                .str.to_date("%Y-%m-%d", strict=False)
-                .alias("valid_date_check")
-            )
-            .filter(pl.col("valid_date_check").is_not_null())
-        )
+    logging.info(f"Found {len(csv_files)} files to process in {BRONZE_DIR}.")
 
-        # Deduplication while preserving source order
-        rows_before = df.height
-        df = df.unique(maintain_order=True)
-        rows_after = df.height
+    # PHASE 2: BATCH PROCESSING
+    for i, file_path in enumerate(csv_files, start=1):
+        file_name = os.path.basename(file_path)
+        full_s3_path = f"s3://{file_path}"
+        logging.info(f"Processing file {i}/{len(csv_files)}: {file_name}")
 
-        if rows_before != rows_after:
-            print(f"  Dropped {rows_before - rows_after} duplicate rows.")
+        try:
+            # STEP 1: LOAD
+            with fs.open(full_s3_path, 'rb') as f:
+                df = pl.read_csv(f, encoding="cp1252")
 
-        # Remove helper and unused source columns
-        df = df.drop([
-            "order_dayofweek",
-            "valid_date_check",
-            "shipping_mode"
-        ])
+            # STEP 2-7: TRANSFORMATIONS
+            df_silver = transform_bronze_to_silver(df)
 
-        # ----------------------------------------------------------------------
-        # STEP 3: FINANCIAL METRIC DERIVATION
-        # ----------------------------------------------------------------------
-        df = (
-            df
-            .with_columns([
-                (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
-                .alias("gross_sales"),
+            # STEP 7: WRITE
+            output_name = f"Fact_{os.path.splitext(file_name)[0]}.parquet"
+            output_path = f"{SILVER_DIR}/{output_name}"
 
-                (
-                    (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
-                    * pl.col("order_item_discount_rate")
-                ).alias("discount_amount")
-            ])
-            .with_columns([
-                (pl.col("gross_sales") - pl.col("discount_amount"))
-                .alias("net_revenue")
-            ])
-            .with_columns([
-                (pl.col("net_revenue") * pl.col("order_item_profit_ratio"))
-                .alias("order_profit_amount")
-            ])
-            .with_columns([
-                (pl.col("net_revenue") - pl.col("order_profit_amount"))
-                .alias("total_cost")
-            ])
-        )
+            with fs.open(output_path, 'wb') as f:
+                df_silver.write_parquet(f)
 
-        # ----------------------------------------------------------------------
-        # STEP 4: OPERATIONAL & STRATEGIC FEATURES
-        # ----------------------------------------------------------------------
-        df = (
-            df
-            .with_columns([
-                (pl.col("total_cost") / pl.col("order_item_quantity"))
-                .alias("actual_unit_cost"),
+            logging.info(f"Saved cleaned data: {output_path}")
 
-                (pl.col("order_profit_amount") < 0)
-                .alias("is_profit_bleeder"),
+            # STEP 8: ARCHIVAL
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_name = f"{os.path.splitext(file_name)[0]}_{timestamp}.csv"
+            archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-                (pl.col("days_for_shipping_real")
-                 - pl.col("days_for_shipment_scheduled"))
-                .alias("shipping_delta")
-            ])
-            .with_columns([
-                (
-                    (pl.col("order_item_product_price") - pl.col("actual_unit_cost"))
-                    / pl.col("actual_unit_cost")
-                ).alias("markup_pct"),
+            # Move file in S3
+            fs.copy(file_path, archive_path.replace("s3://", ""))
+            fs.rm(file_path)
+            logging.info(f"Archived source file: {archive_path}")
 
-                (
-                    pl.col("discount_amount")
-                    / (pl.col("order_profit_amount") + pl.col("discount_amount"))
-                ).fill_nan(0.0).alias("margin_leakage_pct")
-            ])
-        )
+        except Exception as e:
+            logging.error(f"Error processing {file_name}: {e}", exc_info=True)
+            logging.info("Skipping file and continuing batch job.")
 
-        # Categorical segmentation for analysis
-        df = df.with_columns([
-            pl.when(pl.col("shipping_delta") < 0).then("Early")
-              .when(pl.col("shipping_delta") == 0).then("On Time")
-              .otherwise("Late")
-              .alias("delivery_class"),
+    logging.info("Batch processing complete.")
 
-            pl.when(pl.col("days_for_shipment_scheduled") == 0).then("Same Day")
-              .when(pl.col("days_for_shipment_scheduled") <= 2).then("First Class")
-              .when(pl.col("days_for_shipment_scheduled") == 3).then("Second Class")
-              .otherwise("Standard Class")
-              .alias("shipping_mode_clean"),
-
-            pl.date(
-                pl.col("order_year"),
-                pl.col("order_month"),
-                pl.col("order_day")
-            ).dt.strftime("%A").alias("day_name_str"),
-
-            pl.when(
-                pl.date(
-                    pl.col("order_year"),
-                    pl.col("order_month"),
-                    pl.col("order_day")
-                )
-                .dt.strftime("%A")
-                .is_in(["Saturday", "Sunday"])
-            )
-            .then("Weekend")
-            .otherwise("Weekday")
-            .alias("order_day_type"),
-
-            pl.when(pl.col("order_item_product_price") < 60).then("Budget")
-              .when(pl.col("order_item_product_price") <= 250).then("Mainstream")
-              .otherwise("Premium")
-              .alias("price_segment"),
-
-            (
-                pl.col("customer_country").str.replace("EE. UU.", "USA")
-                + "_"
-                + pl.col("customer_state")
-                + " -> "
-                + pl.col("order_country")
-            ).alias("trade_route")
-        ])
-
-        # ----------------------------------------------------------------------
-        # STEP 5: CONTEXTUAL WINDOW METRICS
-        # ----------------------------------------------------------------------
-        df = (
-            df
-            .with_columns([
-                (pl.col("gross_sales")
-                 / pl.col("gross_sales").sum().over("category_name"))
-                .alias("category_share_pct"),
-
-                pl.col("order_state").count().over("order_state")
-                .alias("state_order_count"),
-
-                (pl.col("gross_sales")
-                 / pl.col("gross_sales").sum().over("market"))
-                .alias("market_share_pct")
-            ])
-            .with_columns([
-                pl.when(pl.col("state_order_count") > 100).then("Strategic Hub")
-                  .when(pl.col("state_order_count") < 10).then("Expansion Zone")
-                  .otherwise("Standard Zone")
-                  .alias("state_density_class")
-            ])
-        )
-
-        # ----------------------------------------------------------------------
-        # STEP 6: STAR SCHEMA ENRICHMENT
-        # ----------------------------------------------------------------------
-        dim_geo = pl.read_parquet(dim_geo_path)
-        dim_cust = pl.read_parquet(dim_cust_path)
-        dim_prod = pl.read_parquet(dim_prod_path)
-
-        df = (
-            df
-            .join(dim_geo,
-                  on=["order_state", "order_country", "order_region", "market"],
-                  how="left")
-            .drop(["order_state", "order_country", "order_region", "market"])
-            .join(dim_cust,
-                  on=["customer_state", "customer_country"],
-                  how="left")
-            .drop(["customer_state", "customer_country"])
-            .join(dim_prod,
-                  on=["product_name", "category_name", "department_name"],
-                  how="left")
-            .drop(["product_name", "category_name", "department_name"])
-        )
-
-        # ----------------------------------------------------------------------
-        # STEP 7: FINAL SORT & WRITE
-        # ----------------------------------------------------------------------
-        # Sorting ensures stable downstream clustered indexing in SQL
-        df = df.sort(
-            ["order_year", "order_month", "order_day", "order_item_quantity"]
-        )
-
-        # Normalize column naming
-        df = df.rename({col: col.lower() for col in df.columns})
-
-        output_name = f"Fact_{os.path.splitext(file_name)[0]}.parquet"
-        df.write_parquet(os.path.join(silver_folder_path, output_name))
-        print(f"  Saved cleaned data: {output_name}")
-
-        # ----------------------------------------------------------------------
-        # STEP 8: ARCHIVAL (IDEMPOTENCY)
-        # ----------------------------------------------------------------------
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_name = f"{os.path.splitext(file_name)[0]}_{timestamp}.csv"
-        shutil.move(file_path, os.path.join(archive_folder_path, archive_name))
-
-        print(f"  Archived source file: {archive_name}\n")
-
-    except Exception as e:
-        print(f"  Error processing {file_name}: {e}")
-        print("  Skipping file and continuing batch job.\n")
-
-print("Batch processing complete.")
-
+if __name__ == "__main__":
+    main()
 ```
-
-**Brutal Critique & Improvements:**
-- **"Medallion" on Local C: Drive:** Using hardcoded Windows paths (`D:\Data Lake\Bronze`) is not a real Medallion architecture. It's just moving files between local folders. Use a local S3-compatible object store (like MinIO) or a cloud bucket.
-- **No Orchestration:** This script must be run manually. A real pipeline would be scheduled via Airflow, Dagster, or Prefect.
-- **Silent Failures:** Catching `Exception as e` and simply printing `Skipping file` without a stack trace is dangerous. If a schema changes or memory runs out, the pipeline quietly skips data, leading to incomplete analytics downstream.
-- **Lack of Logging:** `print()` is not a logging framework. Use Python's `logging` module to capture timestamps, log levels, and write to structured files.
-
----
-
-## Step 5: Bronze to Silver Processing (Single File Pipeline)
-
-**Explanation:**
-This script does exactly the same transformations as the Batch Process, but it is hardcoded to process a single, massive CSV file instead of iterating through a folder.
 
 **Code (`pipelines/Project_Single_File.py`):**
 ```python
-"""
-Purpose:
-    Single-file Bronze → Silver processing pipeline for supply chain data.
-
-What this script does:
-    - Processes a single large CSV file from the Bronze layer
-    - Validates records, removes duplicates, and cleans schema issues
-    - Derives financial, operational, and strategic analytical fields
-    - Enriches data by joining curated dimension tables
-    - Writes a single Parquet fact file to the Silver layer
-    - Archives the processed source file to ensure idempotency
-
-What this script does NOT do:
-    - No batch orchestration
-    - No model training or synthetic data generation
-    - No SQL loading or BI logic
-"""
-
 import polars as pl
-import shutil
+import s3fs
 import os
+import logging
 from datetime import datetime
+import sys
 
-# ==============================================================================
-# CONFIGURATION & PATHS
-# ==============================================================================
-# Source file (Bronze Layer)
-SOURCE_FILE_PATH = r"D:\Data Lake\Bronze\DataCo_Final_2M.csv"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Target output (Silver Layer)
-TARGET_FILE_PATH = r"D:\Data Lake\Silver\DataCo_Silver.parquet"
+from config import BRONZE_DIR, SILVER_DIR, ARCHIVE_DIR, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+from pipelines.transformations import transform_bronze_to_silver
 
-# Archive location for processed source files
-ARCHIVE_FOLDER = r"D:\Data Lake\Archive"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Dimension tables (pre-cleaned, static Parquet files)
-DIM_PATHS = {
-    "geo":  r"D:\Data Lake\Silver\dim_geo.parquet",
-    "cust": r"D:\Data Lake\Silver\Dim_Customer_Geo.parquet",
-    "prod": r"D:\Data Lake\Silver\Dim_Product.parquet"
-}
+def main():
+    storage_options = get_s3_storage_options()
 
-# ==============================================================================
-# PIPELINE EXECUTION
-# ==============================================================================
-file_name = os.path.basename(SOURCE_FILE_PATH)
-print(f"Starting single-file pipeline for: {file_name}")
-
-try:
-    # --------------------------------------------------------------------------
-    # STEP 1: LOAD & INITIAL CLEANUP
-    # --------------------------------------------------------------------------
-    # Using cp1252 encoding to handle Western European character sets correctly
-    df = pl.read_csv(SOURCE_FILE_PATH, encoding="cp1252")
-    print(f"Original row count: {df.height}")
-
-    # Validate dates early to prevent invalid records from propagating
-    df = (
-        df
-        .with_columns(
-            pl.format(
-                "{}-{}-{}",
-                pl.col("order_year"),
-                pl.col("order_month"),
-                pl.col("order_day")
-            )
-            .str.to_date("%Y-%m-%d", strict=False)
-            .alias("valid_date_check")
-        )
-        .filter(pl.col("valid_date_check").is_not_null())
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
     )
 
-    # Deduplicate while preserving source order
-    rows_before = df.height
-    df = df.unique(maintain_order=True)
-    rows_after = df.height
+    source_file_name = "DataCo_Final_2M.csv"
+    source_file_path = f"{BRONZE_DIR}/{source_file_name}"
 
-    if rows_before != rows_after:
-        print(f"Removed {rows_before - rows_after} duplicate rows.")
+    target_file_name = "DataCo_Silver.parquet"
+    target_file_path = f"{SILVER_DIR}/{target_file_name}"
 
-    # Drop helper and unused source columns
-    df = df.drop([
-        "order_dayofweek",
-        "valid_date_check",
-        "shipping_mode"
-    ])
+    if not fs.exists(source_file_path.replace("s3://", "")):
+        logging.error(f"Source file not found: {source_file_path}")
+        return
 
-    # --------------------------------------------------------------------------
-    # STEP 2: FINANCIAL METRIC DERIVATION (P&L FOUNDATION)
-    # --------------------------------------------------------------------------
-    df = (
-        df
-        .with_columns([
-            (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
-            .alias("gross_sales"),
+    logging.info(f"Starting single-file pipeline for: {source_file_name}")
 
-            (
-                (pl.col("order_item_product_price") * pl.col("order_item_quantity"))
-                * pl.col("order_item_discount_rate")
-            ).alias("discount_amount")
-        ])
-        .with_columns([
-            (pl.col("gross_sales") - pl.col("discount_amount"))
-            .alias("net_revenue")
-        ])
-        .with_columns([
-            (pl.col("net_revenue") * pl.col("order_item_profit_ratio"))
-            .alias("order_profit_amount")
-        ])
-        .with_columns([
-            (pl.col("net_revenue") - pl.col("order_profit_amount"))
-            .alias("total_cost")
-        ])
-    )
+    try:
+        # STEP 1: LOAD
+        with fs.open(source_file_path, 'rb') as f:
+            df = pl.read_csv(f, encoding="cp1252")
 
-    # --------------------------------------------------------------------------
-    # STEP 3: OPERATIONAL & STRATEGIC FEATURES
-    # --------------------------------------------------------------------------
-    df = (
-        df
-        .with_columns([
-            (pl.col("total_cost") / pl.col("order_item_quantity"))
-            .alias("actual_unit_cost"),
+        logging.info(f"Original row count: {df.height}")
 
-            (pl.col("order_profit_amount") < 0)
-            .alias("is_profit_bleeder"),
+        # STEP 2-7: TRANSFORMATIONS
+        df_silver = transform_bronze_to_silver(df)
 
-            (pl.col("days_for_shipping_real")
-             - pl.col("days_for_shipment_scheduled"))
-            .alias("shipping_delta")
-        ])
-        .with_columns([
-            (
-                (pl.col("order_item_product_price") - pl.col("actual_unit_cost"))
-                / pl.col("actual_unit_cost")
-            ).alias("markup_pct"),
+        # STEP 7: WRITE
+        with fs.open(target_file_path, 'wb') as f:
+            df_silver.write_parquet(f)
 
-            (
-                pl.col("discount_amount")
-                / (pl.col("order_profit_amount") + pl.col("discount_amount"))
-            ).fill_nan(0.0).alias("margin_leakage_pct")
-        ])
-    )
+        logging.info(f"Processed file saved to: {target_file_path}")
+        logging.info(f"Final row count: {df_silver.height}")
 
-    # Categorical segmentation for analysis
-    df = df.with_columns([
-        pl.when(pl.col("shipping_delta") < 0).then("Early")
-          .when(pl.col("shipping_delta") == 0).then("On Time")
-          .otherwise("Late")
-          .alias("delivery_class"),
+        # STEP 8: ARCHIVAL
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name, ext = os.path.splitext(source_file_name)
+        archive_name = f"{name}_{timestamp}{ext}"
+        archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-        pl.when(pl.col("days_for_shipment_scheduled") == 0).then("Same Day")
-          .when(pl.col("days_for_shipment_scheduled") <= 2).then("First Class")
-          .when(pl.col("days_for_shipment_scheduled") == 3).then("Second Class")
-          .otherwise("Standard Class")
-          .alias("shipping_mode_clean"),
+        # Move file in S3
+        fs.copy(source_file_path.replace("s3://", ""), archive_path.replace("s3://", ""))
+        fs.rm(source_file_path.replace("s3://", ""))
 
-        pl.date(
-            pl.col("order_year"),
-            pl.col("order_month"),
-            pl.col("order_day")
-        ).dt.strftime("%A").alias("day_name_str"),
+        logging.info(f"Archived source file as: {archive_path}")
 
-        pl.when(
-            pl.date(
-                pl.col("order_year"),
-                pl.col("order_month"),
-                pl.col("order_day")
-            )
-            .dt.strftime("%A")
-            .is_in(["Saturday", "Sunday"])
-        )
-        .then("Weekend")
-        .otherwise("Weekday")
-        .alias("order_day_type"),
+    except Exception as e:
+        logging.error(f"Pipeline failed. Error details: {e}", exc_info=True)
 
-        pl.when(pl.col("order_item_product_price") < 60).then("Budget")
-          .when(pl.col("order_item_product_price") <= 250).then("Mainstream")
-          .otherwise("Premium")
-          .alias("price_segment"),
-
-        (
-            pl.col("customer_country").str.replace("EE. UU.", "USA")
-            + "_"
-            + pl.col("customer_state")
-            + " -> "
-            + pl.col("order_country")
-        ).alias("trade_route")
-    ])
-
-    # --------------------------------------------------------------------------
-    # STEP 4: CONTEXTUAL WINDOW METRICS
-    # --------------------------------------------------------------------------
-    df = (
-        df
-        .with_columns([
-            (pl.col("gross_sales")
-             / pl.col("gross_sales").sum().over("category_name"))
-            .alias("category_share_pct"),
-
-            pl.col("order_state").count().over("order_state")
-            .alias("state_order_count"),
-
-            (pl.col("gross_sales")
-             / pl.col("gross_sales").sum().over("market"))
-            .alias("market_share_pct")
-        ])
-        .with_columns([
-            pl.when(pl.col("state_order_count") > 100).then("Strategic Hub")
-              .when(pl.col("state_order_count") < 10).then("Expansion Zone")
-              .otherwise("Standard Zone")
-              .alias("state_density_class")
-        ])
-    )
-
-    # --------------------------------------------------------------------------
-    # STEP 5: STAR SCHEMA ENRICHMENT
-    # --------------------------------------------------------------------------
-    dim_geo = pl.read_parquet(DIM_PATHS["geo"])
-    dim_cust = pl.read_parquet(DIM_PATHS["cust"])
-    dim_prod = pl.read_parquet(DIM_PATHS["prod"])
-
-    df = (
-        df
-        .join(dim_geo,
-              on=["order_state", "order_country", "order_region", "market"],
-              how="left")
-        .drop(["order_state", "order_country", "order_region", "market"])
-        .join(dim_cust,
-              on=["customer_state", "customer_country"],
-              how="left")
-        .drop(["customer_state", "customer_country"])
-        .join(dim_prod,
-              on=["product_name", "category_name", "department_name"],
-              how="left")
-        .drop(["product_name", "category_name", "department_name"])
-    )
-
-    # --------------------------------------------------------------------------
-    # STEP 6: FINAL SORT & EXPORT
-    # --------------------------------------------------------------------------
-    # Sorting ensures stable downstream clustered indexing in SQL
-    df = df.sort(
-        ["order_year", "order_month", "order_day", "order_item_quantity"]
-    )
-
-    # Normalize column naming
-    df = df.rename({col: col.lower() for col in df.columns})
-
-    df.write_parquet(TARGET_FILE_PATH)
-    print(f"Processed file saved to: {TARGET_FILE_PATH}")
-    print(f"Final row count: {df.height}")
-
-    # --------------------------------------------------------------------------
-    # STEP 7: ARCHIVAL (IDEMPOTENCY)
-    # --------------------------------------------------------------------------
-    os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name, ext = os.path.splitext(file_name)
-    archive_name = f"{name}_{timestamp}{ext}"
-
-    shutil.move(SOURCE_FILE_PATH, os.path.join(ARCHIVE_FOLDER, archive_name))
-    print(f"Archived source file as: {archive_name}")
-
-except Exception as e:
-    print("Pipeline failed.")
-    print(f"Error details: {e}")
-
+if __name__ == "__main__":
+    main()
 ```
 
-**Brutal Critique & Improvements:**
-- **Extreme Code Duplication (Violation of DRY):** This file is almost a 1:1 copy-paste of the transformation logic from `Project_Batch_Process.py`. You should NEVER copy-paste 200 lines of transformation logic. The Polars transformations should be abstracted into a function `def transform_to_silver(df)` located in a shared module that both scripts import.
-- **Hardcoded Configuration:** The file paths are completely hardcoded. Use `.env` or a configuration file (like `config.yml`) so the code is environment-agnostic.
+**Critique & Improvements:**
+- **Improvement:** The integration of `s3fs` for object storage and the `logging` module drastically improves the maturity of these scripts. They now behave like real cloud-native applications.
+- **Nitpick:** There's still a slight repetition between how the batch and single file scripts handle the file system and logging setups.
 
 ---
 
 ## Step 6: Silver to SQL Loading Pipeline
 
 **Explanation:**
-Once the data is refined in the Silver layer (Parquet), this script connects to the SQL Server database and loads the data into the `Fact_Sales` table. It enforces a strict column schema to ensure only the expected columns are appended, and then archives the loaded Parquet files.
+Reads the curated Parquet files from S3/MinIO and loads them into the SQL Server data warehouse using SQLAlchemy. It features a test mode that gracefully falls back to a local SQLite database for local execution.
 
 **Code (`pipelines/Project_Silver_To_SQL.py`):**
 ```python
-"""
-Purpose:
-    Load curated Silver-layer fact data into SQL Server.
-
-What this script does:
-    - Reads fact-level Parquet files from the Silver layer
-    - Enforces a strict column contract aligned with the SQL table schema
-    - Appends data into the SQL Server fact table
-    - Archives successfully loaded files to ensure idempotent execution
-
-What this script does NOT do:
-    - No transformations or business logic
-    - No dimensional modeling
-    - No table creation or schema changes
-"""
-
 import polars as pl
-import pandas as pd
-import shutil
+import s3fs
 import os
-import glob
+import logging
 from sqlalchemy import create_engine
 from datetime import datetime
+import sys
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-SERVER_NAME = "localhost"
-DATABASE = "DataCo_Analytics"
-DRIVER = "ODBC Driver 17 for SQL Server"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SILVER_FOLDER = r"D:\Data Lake\Silver"
-ARCHIVE_FOLDER = r"D:\Data Lake\archive_silver"
+from config import SILVER_DIR, ARCHIVE_DIR, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 TABLE_NAME = "Fact_Sales"
 
-connection_string = (
-    f"mssql+pyodbc://@{SERVER_NAME}/{DATABASE}"
-    f"?driver={DRIVER}&trusted_connection=yes"
-)
-
-# Explicit column contract matching the SQL table schema exactly
 STRICT_COLUMNS = [
-    # Keys
     "geo_id", "customer_geo_id", "product_key",
-
-    # Time (year / month / day only)
     "order_year", "order_month", "order_day",
     "day_name_str", "order_day_type",
-
-    # Logistics
     "type", "days_for_shipping_real", "days_for_shipment_scheduled",
     "shipping_delta", "delivery_class", "shipping_mode_clean",
     "order_status", "customer_segment",
-
-    # Financials
     "order_item_quantity", "order_item_product_price",
     "order_item_discount_rate", "order_item_profit_ratio",
     "gross_sales", "discount_amount", "net_revenue",
     "order_profit_amount", "total_cost", "actual_unit_cost",
-
-    # Metrics
     "is_profit_bleeder", "markup_pct", "margin_leakage_pct",
     "price_segment", "trade_route",
     "state_order_count", "state_density_class"
 ]
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
 def main():
-    print("Starting Silver → SQL fact load pipeline.")
+    logging.info("Starting Silver → SQL fact load pipeline.")
 
-    # --------------------------------------------------------------------------
-    # STEP 1: CONNECT TO SQL SERVER
-    # --------------------------------------------------------------------------
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+    )
+
+    is_testing = os.getenv("TEST_MODE", "false").lower() == "true"
+
+    if is_testing:
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_analytics.db")
+        connection_string = f"sqlite:///{db_path}"
+        logging.info(f"Running in test mode. Using SQLite at {db_path}")
+    else:
+        connection_string = (
+            f"mssql+pyodbc://@{SQL_SERVER_NAME}/{SQL_DATABASE}"
+            f"?driver={SQL_DRIVER}&trusted_connection=yes"
+        )
+
     try:
-        engine = create_engine(connection_string)
+        if is_testing:
+            engine = create_engine(connection_string)
+        else:
+            engine = create_engine(connection_string, fast_executemany=True)
+
         with engine.connect():
             pass
-        print("Connected to SQL Server.")
+        logging.info("Connected to database.")
     except Exception as e:
-        print(f"Connection failed: {e}")
+        logging.error(f"Connection failed: {e}")
         return
 
-    # --------------------------------------------------------------------------
-    # STEP 2: DISCOVER FACT FILES
-    # --------------------------------------------------------------------------
-    parquet_files = glob.glob(os.path.join(SILVER_FOLDER, "Fact_*.parquet"))
+    silver_path_no_scheme = SILVER_DIR.replace("s3://", "")
+    parquet_files = fs.glob(f"{silver_path_no_scheme}/Fact_*.parquet")
+
+    single_file = f"{silver_path_no_scheme}/DataCo_Silver.parquet"
+    if fs.exists(single_file) and single_file not in parquet_files:
+        parquet_files.append(single_file)
 
     if not parquet_files:
-        print("No fact Parquet files found to load.")
+        logging.info("No fact Parquet files found to load.")
         return
 
-    print(f"Found {len(parquet_files)} files to load.\n")
+    logging.info(f"Found {len(parquet_files)} files to load.")
 
-    # --------------------------------------------------------------------------
-    # STEP 3: LOAD LOOP
-    # --------------------------------------------------------------------------
     for i, file_path in enumerate(parquet_files, start=1):
         file_name = os.path.basename(file_path)
-        print(f"Processing file {i}/{len(parquet_files)}: {file_name}")
+        full_s3_path = f"s3://{file_path}"
+        logging.info(f"Processing file {i}/{len(parquet_files)}: {file_name}")
 
         try:
-            # Read Parquet
-            df = pl.read_parquet(file_path)
+            with fs.open(full_s3_path, 'rb') as f:
+                df = pl.read_parquet(f)
 
-            # Enforce strict schema alignment
-            df_clean = df.select(STRICT_COLUMNS)
-            print(f"Loading {df_clean.height} rows into SQL.")
+            available_columns = [col for col in STRICT_COLUMNS if col in df.columns]
+            if len(available_columns) < len(STRICT_COLUMNS):
+                missing = set(STRICT_COLUMNS) - set(available_columns)
+                logging.warning(f"File missing strict columns: {missing}")
 
-            # Append to SQL table
+            df_clean = df.select(available_columns)
+            logging.info(f"Loading {df_clean.height} rows into SQL.")
+
             df_clean.to_pandas().to_sql(
                 name=TABLE_NAME,
                 con=engine,
@@ -1536,28 +1328,114 @@ def main():
                 chunksize=10_000
             )
 
-            print("Load successful.")
+            logging.info("Load successful.")
 
-            # Archive processed file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             archive_name = f"LOADED_{file_name}_{timestamp}.parquet"
-            os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
-            shutil.move(file_path, os.path.join(ARCHIVE_FOLDER, archive_name))
+            archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-            print(f"Archived file as: {archive_name}\n")
+            fs.copy(file_path, archive_path.replace("s3://", ""))
+            fs.rm(file_path)
+            logging.info(f"Archived file as: {archive_path}")
 
         except Exception as e:
-            print(f"Error loading {file_name}: {e}")
-            print("Skipping file.\n")
+            logging.error(f"Error loading {file_name}: {e}", exc_info=True)
+            logging.info("Skipping file.")
 
-    print("Silver → SQL pipeline completed.")
+    logging.info("Silver → SQL pipeline completed.")
 
 if __name__ == "__main__":
     main()
-
 ```
 
-**Brutal Critique & Improvements:**
-- **Pandas Bottleneck:** You used the lightning-fast Polars library for all transformations, but here you convert the data to Pandas just to use `to_sql()`. Pandas' `to_sql()` is incredibly slow for bulk operations. For SQL Server, you should use the `bcp` utility (Bulk Copy Program), or use SQLAlchemy with `fast_executemany=True` directly from Polars/Arrow.
-- **Hardcoded Credentials:** The `connection_string` with `SERVER_NAME` and `DATABASE` is hardcoded. This is a bad practice. DB connections should be passed via environment variables for security and flexibility.
-- **Lack of Upsert Logic (MERGE):** The pipeline uses `if_exists="append"`. If a file accidentally gets placed in the Silver folder twice (or an archive step fails), you will insert duplicate rows. A robust pipeline uses a `MERGE` statement (upsert) to update existing records and insert new ones based on a unique business key.
+**Code (`pipelines/Project_Dimension_Table_To_SQL.py`):**
+```python
+import polars as pl
+import s3fs
+from sqlalchemy import create_engine
+import logging
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import DIM_GEO_PATH, DIM_CUST_PATH, DIM_PROD_PATH, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+DIM_PATHS = {
+    "Dim_Geo": DIM_GEO_PATH,
+    "Dim_Customer_Geo": DIM_CUST_PATH,
+    "Dim_Product": DIM_PROD_PATH
+}
+
+def main():
+    logging.info("Starting dimension load pipeline.")
+
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+    )
+
+    is_testing = os.getenv("TEST_MODE", "false").lower() == "true"
+
+    if is_testing:
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_analytics.db")
+        connection_string = f"sqlite:///{db_path}"
+        logging.info(f"Running in test mode. Using SQLite at {db_path}")
+    else:
+        connection_string = (
+            f"mssql+pyodbc://@{SQL_SERVER_NAME}/{SQL_DATABASE}"
+            f"?driver={SQL_DRIVER}&trusted_connection=yes"
+        )
+
+    try:
+        if is_testing:
+            engine = create_engine(connection_string)
+        else:
+            engine = create_engine(connection_string, fast_executemany=True)
+
+        with engine.connect():
+            pass
+        logging.info("Connected to database.")
+    except Exception as e:
+        logging.error(f"Connection failed: {e}")
+        return
+
+    for table_name, file_path in DIM_PATHS.items():
+        logging.info(f"Loading dimension table: {table_name}")
+
+        if not fs.exists(file_path.replace("s3://", "")):
+            logging.error(f"File not found: {file_path}")
+            continue
+
+        try:
+            with fs.open(file_path, 'rb') as f:
+                df = pl.read_parquet(f)
+
+            logging.info(f"Read {df.height} rows.")
+
+            df.to_pandas().to_sql(
+                name=table_name,
+                con=engine,
+                if_exists="append",
+                index=False,
+                chunksize=10_000
+            )
+
+            logging.info(f"Loaded {table_name} successfully.")
+
+        except Exception as e:
+            logging.error(f"Error loading {table_name}: {e}", exc_info=True)
+            logging.info("Skipping this dimension.")
+
+    logging.info("Dimension loading complete.")
+
+if __name__ == "__main__":
+    main()
+```
+
+**Critique & Improvements:**
+- **Improvement:** Adding `fast_executemany=True` to the SQLAlchemy engine solves the previous Pandas bottleneck for bulk inserts into SQL Server. The `TEST_MODE` fallback is a great developer experience feature.
+- **Critique:** The script still uses `if_exists="append"` rather than a true UPSERT/MERGE logic. If a file is re-processed, it will duplicate data in the warehouse.

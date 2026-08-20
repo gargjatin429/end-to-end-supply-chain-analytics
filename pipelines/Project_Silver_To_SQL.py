@@ -1,114 +1,99 @@
-"""
-Purpose:
-    Load curated Silver-layer fact data into SQL Server.
-
-What this script does:
-    - Reads fact-level Parquet files from the Silver layer
-    - Enforces a strict column contract aligned with the SQL table schema
-    - Appends data into the SQL Server fact table
-    - Archives successfully loaded files to ensure idempotent execution
-
-What this script does NOT do:
-    - No transformations or business logic
-    - No dimensional modeling
-    - No table creation or schema changes
-"""
-
 import polars as pl
-import pandas as pd
-import shutil
+import s3fs
 import os
-import glob
+import logging
 from sqlalchemy import create_engine
 from datetime import datetime
+import sys
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-SERVER_NAME = "localhost"
-DATABASE = "DataCo_Analytics"
-DRIVER = "ODBC Driver 17 for SQL Server"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SILVER_FOLDER = r"D:\Data Lake\Silver"
-ARCHIVE_FOLDER = r"D:\Data Lake\archive_silver"
+from config import SILVER_DIR, ARCHIVE_DIR, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 TABLE_NAME = "Fact_Sales"
 
-connection_string = (
-    f"mssql+pyodbc://@{SERVER_NAME}/{DATABASE}"
-    f"?driver={DRIVER}&trusted_connection=yes"
-)
-
-# Explicit column contract matching the SQL table schema exactly
 STRICT_COLUMNS = [
-    # Keys
     "geo_id", "customer_geo_id", "product_key",
-
-    # Time (year / month / day only)
     "order_year", "order_month", "order_day",
     "day_name_str", "order_day_type",
-
-    # Logistics
     "type", "days_for_shipping_real", "days_for_shipment_scheduled",
     "shipping_delta", "delivery_class", "shipping_mode_clean",
     "order_status", "customer_segment",
-
-    # Financials
     "order_item_quantity", "order_item_product_price",
     "order_item_discount_rate", "order_item_profit_ratio",
     "gross_sales", "discount_amount", "net_revenue",
     "order_profit_amount", "total_cost", "actual_unit_cost",
-
-    # Metrics
     "is_profit_bleeder", "markup_pct", "margin_leakage_pct",
     "price_segment", "trade_route",
     "state_order_count", "state_density_class"
 ]
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
 def main():
-    print("Starting Silver → SQL fact load pipeline.")
+    logging.info("Starting Silver → SQL fact load pipeline.")
 
-    # --------------------------------------------------------------------------
-    # STEP 1: CONNECT TO SQL SERVER
-    # --------------------------------------------------------------------------
+    fs = s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+    )
+
+    is_testing = os.getenv("TEST_MODE", "false").lower() == "true"
+
+    if is_testing:
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_analytics.db")
+        connection_string = f"sqlite:///{db_path}"
+        logging.info(f"Running in test mode. Using SQLite at {db_path}")
+    else:
+        connection_string = (
+            f"mssql+pyodbc://@{SQL_SERVER_NAME}/{SQL_DATABASE}"
+            f"?driver={SQL_DRIVER}&trusted_connection=yes"
+        )
+
     try:
-        engine = create_engine(connection_string)
+        if is_testing:
+            engine = create_engine(connection_string)
+        else:
+            engine = create_engine(connection_string, fast_executemany=True)
+
         with engine.connect():
             pass
-        print("Connected to SQL Server.")
+        logging.info("Connected to database.")
     except Exception as e:
-        print(f"Connection failed: {e}")
+        logging.error(f"Connection failed: {e}")
         return
 
-    # --------------------------------------------------------------------------
-    # STEP 2: DISCOVER FACT FILES
-    # --------------------------------------------------------------------------
-    parquet_files = glob.glob(os.path.join(SILVER_FOLDER, "Fact_*.parquet"))
+    silver_path_no_scheme = SILVER_DIR.replace("s3://", "")
+    parquet_files = fs.glob(f"{silver_path_no_scheme}/Fact_*.parquet")
+
+    single_file = f"{silver_path_no_scheme}/DataCo_Silver.parquet"
+    if fs.exists(single_file) and single_file not in parquet_files:
+        parquet_files.append(single_file)
 
     if not parquet_files:
-        print("No fact Parquet files found to load.")
+        logging.info("No fact Parquet files found to load.")
         return
 
-    print(f"Found {len(parquet_files)} files to load.\n")
+    logging.info(f"Found {len(parquet_files)} files to load.")
 
-    # --------------------------------------------------------------------------
-    # STEP 3: LOAD LOOP
-    # --------------------------------------------------------------------------
     for i, file_path in enumerate(parquet_files, start=1):
         file_name = os.path.basename(file_path)
-        print(f"Processing file {i}/{len(parquet_files)}: {file_name}")
+        full_s3_path = f"s3://{file_path}"
+        logging.info(f"Processing file {i}/{len(parquet_files)}: {file_name}")
 
         try:
-            # Read Parquet
-            df = pl.read_parquet(file_path)
+            with fs.open(full_s3_path, 'rb') as f:
+                df = pl.read_parquet(f)
 
-            # Enforce strict schema alignment
-            df_clean = df.select(STRICT_COLUMNS)
-            print(f"Loading {df_clean.height} rows into SQL.")
+            available_columns = [col for col in STRICT_COLUMNS if col in df.columns]
+            if len(available_columns) < len(STRICT_COLUMNS):
+                missing = set(STRICT_COLUMNS) - set(available_columns)
+                logging.warning(f"File missing strict columns: {missing}")
 
-            # Append to SQL table
+            df_clean = df.select(available_columns)
+            logging.info(f"Loading {df_clean.height} rows into SQL.")
+
             df_clean.to_pandas().to_sql(
                 name=TABLE_NAME,
                 con=engine,
@@ -117,21 +102,21 @@ def main():
                 chunksize=10_000
             )
 
-            print("Load successful.")
+            logging.info("Load successful.")
 
-            # Archive processed file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             archive_name = f"LOADED_{file_name}_{timestamp}.parquet"
-            os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
-            shutil.move(file_path, os.path.join(ARCHIVE_FOLDER, archive_name))
+            archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-            print(f"Archived file as: {archive_name}\n")
+            fs.copy(file_path, archive_path.replace("s3://", ""))
+            fs.rm(file_path)
+            logging.info(f"Archived file as: {archive_path}")
 
         except Exception as e:
-            print(f"Error loading {file_name}: {e}")
-            print("Skipping file.\n")
+            logging.error(f"Error loading {file_name}: {e}", exc_info=True)
+            logging.info("Skipping file.")
 
-    print("Silver → SQL pipeline completed.")
+    logging.info("Silver → SQL pipeline completed.")
 
 if __name__ == "__main__":
     main()
