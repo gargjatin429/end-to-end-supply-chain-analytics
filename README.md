@@ -1,177 +1,87 @@
-Supply Chain Failure Analysis: Revenue Growth Without Profit
+# Supply Chain Failure Analysis: Revenue Growth Without Profit
 
-End-to-end analytical case study investigating how operational inefficiencies, logistics failures, and fraud risk caused profit collapse despite strong revenue growth.
+> **An end-to-end analytical data engineering and BI case study investigating how operational inefficiencies, logistics failures, and fraud risk caused profit collapse despite strong revenue growth.**
 
+![Status](https://img.shields.io/badge/Status-Complete-success)
+![Architecture](https://img.shields.io/badge/Architecture-Medallion%20%7C%20MinIO%20S3-blue)
+![Stack](https://img.shields.io/badge/Stack-Python%20%7C%20SQL%20Server%20%7C%20PowerBI-yellow)
 
 ---
 
-📌 Project Scope
+## 📌 Project Scope
 
-What this is:
-
-Main Goal:
-
+### What this is
 Diagnose why strong revenue growth failed to translate into profit by identifying operational inefficiencies, logistics failures, and fraud risk across the supply chain.
 
-Tech / Analytical Focus: 
+### Technical & Architectural Focus
+This project showcases a **modern, enterprise-grade data engineering workflow running entirely locally**. It implements a strict **Medallion Architecture (Bronze → Silver → Gold/SQL)** powered by a local **MinIO S3 Object Store**.
 
-Designed a local Medallion-style analytical workflow with idempotent processing, archival layers, and star-schema modeling, using Microsoft SQL Server as the analytical warehouse for dimensional modeling, PK/FK enforcement, and SQL-driven analysis; supported by SDV (CTGAN)–based synthetic data scaling on Google Colab solely for data generation to stress-test analysis beyond Excel-scale limits.
+- **Idempotent pipelines** stream data from S3 using `s3fs` and `polars`.
+- **Microsoft SQL Server** acts as the serving layer for dimensional star-schema modeling and SQL-driven analysis.
+- **SDV (CTGAN)** on Google Colab was used to synthesize 2 million rows of transaction data to stress-test the SQL logic beyond standard Excel-scale limits.
 
-Intermediate datasets (Fact and Dimension Tables) were stored in Parquet format to support columnar analytics and efficient downstream processing.
-
-
-What this is NOT:
-
-Not a Predictive ML Project: SDV (Synthetic Data Vault) was used strictly for data upscaling to stress-test the SQL logic.
-
-Not a Production ETL Pipeline: This is an analytical workflow focused on business insights, not real-time data engineering.
-
+### What this is NOT
+- **Not a Predictive ML Project:** SDV was used strictly for data upscaling to stress-test the SQL logic, not for predictive modeling.
+- **Not a Production Orchestration Demo:** This is an analytical workflow focused on business insights and data structuring, rather than Airflow/Dagster scheduling.
 
 ---
 
-📊 The Dashboard
+## 🛠 Workflow & Architecture
+
+### 1. The MinIO (Local S3) Data Lake
+We moved away from brittle, hardcoded local file paths and implemented a true object storage data lake using **MinIO**. A centralized `config.py` manages S3 endpoints, buckets (`s3://data-lake/bronze`, `s3://data-lake/silver`), and credentials.
+
+### 2. Raw Data & Synthetic Scaling (Colab)
+- Cleaned the original Kaggle DataCo dataset to resolve severe encoding issues and schema drift.
+- Trained an SDV (CTGAN) model to generate ~2 million synthetic rows, bypassing local compute constraints to stress-test the pipeline.
+
+### 3. Bronze → Silver Processing (Polars + S3)
+- Implemented extremely fast, strictly DRY pipelines using `polars` that read directly from the S3 Bronze bucket.
+- Transforms derive highly-specific business metrics (e.g., `margin_leakage_pct`, `is_profit_bleeder`).
+- Writes fully relational, columnar `.parquet` files to the Silver S3 bucket, whilst archiving processed source files for idempotency.
+
+### 4. Silver → SQL Serving Pipeline
+- Extracts curated Silver data from S3 and bulks-loads it into SQL Server using SQLAlchemy (`fast_executemany` enabled for massive performance gains).
+- **TEST_MODE:** Built-in support to seamlessly swap MS SQL Server for a local SQLite database, allowing end-to-end CI/CD testing without needing external database infrastructure.
+
+---
+
+## 📊 Analytical Insights & Dashboards
 
 A four-page analytical case study showing how strong revenue growth from 2015–2017 masked operational and risk failures, culminating in a sharp business collapse in 2018.
 
-## The Dashboards
+| Executive Overview | Product & Portfolio Analysis |
+|:---:|:---:|
+| ![Executive Overview](docs/images/dashboard_page_1.png) | ![Product & Portfolio Analysis](docs/images/dashboard_page_2.png) |
+| *Identifies strong revenue masking margin collapse driven by logistics delays and fraud.* | *Reveals revenue concentration in Fan Shop while profitability is driven by Budget segments.* |
 
-![Executive Overview](docs/images/dashboard_page_1.png)
-Fig. 1: Identifies strong revenue masking margin collapse driven by logistics delays and fraud.
-
-![Product & Portfolio Analysis](docs/images/dashboard_page_2.png)
-Fig. 2: Reveals revenue concentration in Fan Shop while profitability is driven by Budget segments.
-
-![Operational Performance](docs/images/dashboard_page_3.png)
-Fig. 3: Pinpoints First Class shipping and Puerto Rico routes as primary delivery delay drivers.
-
-![Fraud & Risk Exposure](docs/images/dashboard_page_4.png)
-Fig. 4: Exposes transfer payments in Consumer segments as the dominant fraud vector.
-
-## Data Model & Semantic Layer
-
-![Power BI data model](docs/images/dashboard_model.png)
-Fig. 5: Power BI data model supporting analytical queries (Star Schema).
+| Operational Performance | Fraud & Risk Exposure |
+|:---:|:---:|
+| ![Operational Performance](docs/images/dashboard_page_3.png) | ![Fraud & Risk Exposure](docs/images/dashboard_page_4.png) |
+| *Pinpoints First Class shipping and Puerto Rico routes as primary delivery delay drivers.* | *Exposes transfer payments in Consumer segments as the dominant fraud vector.* |
 
 ---
 
-🛠 Workflow & Architecture
+## 📂 Repository Structure
 
-1. Raw Data Preparation (Python)
-
-- Ingested the original DataCo supply chain dataset from Kaggle and performed extensive cleaning  to resolve encoding issues, inconsistent text values, invalid dates, and schema inconsistencies.
-
-- Prepared a normalized, model-ready dataset suitable for synthetic data generation.
-
-2. Synthetic Data Scaling (SDV on Google Colab)
-
-- Trained an SDV (CTGAN) model on the cleaned dataset using Google Colab (Free Tier) due to local compute constraints.
-
-- Generated ~2 million synthetic rows to enable stress-testing of analytical logic beyond Excel-scale limitations while preserving key data relationships.
-
-3. Bronze → Silver Processing (Local Pipelines)
-
-- Implemented local Bronze-to-Silver pipelines to standardize schemas, enforce data types, and apply calculated fields.
-
-- Designed both single-file and batch-processing workflows with idempotent execution and archival handling to ensure reproducibility and safe re-runs.
-
-4. Analytical Data Modeling (SQL Server)
-
-- Created a relational analytical database in Microsoft SQL Server.
-
-- Modeled fact and dimension tables using a star schema and enforced primary and foreign key relationships to support analytical queries.
-
-5. Silver → SQL Loading Pipeline
-
-- Developed a dedicated pipeline to load curated Silver-layer data into SQL Server tables, ensuring referential integrity and consistent analytical state.
-
-6. BI Consumption & Analytical Measures (Power BI, Import Mode)
-
-- Imported the modeled SQL data into Power BI using Import mode for stable performance and consistent metric evaluation.
-
-- Created analytical DAX measures (stored in a dedicated "_key_measures" layer) to calculate KPIs, performance indicators, and risk metrics used across dashboards.
-
+```text
+├── config.py             # Central MinIO S3 object store and SQL database config
+├── data_scaling/         # Google Colab notebooks for CTGAN synthetic generation
+├── docs/                 # Dimension setup and architectural docs
+├── pipelines/            # Bronze → Silver (Polars) and Silver → SQL (S3fs) scripts
+│   ├── transformations.py           # Core DRY Polars logic
+│   ├── Project_Batch_Process.py     # Main Medallion S3 batch processor
+│   └── Project_Single_File_Redundant.py # Maintained for legacy reference
+├── powerbi/              # The .pbix dashboard file and DAX measures
+└── sql/                  # DDLs and analytical queries for SQL Server
+```
 
 ---
 
-❓ Business Questions Solved
+## ⚙️ Tech Stack
 
-1. Why did the business collapse in 2018 despite strong revenue growth from 2015–2017?
-→ Revenue growth masked margin erosion caused by logistics delays and fraud-related losses, which compounded over time and led to a sharp collapse.
-
-2. Which products and price segments drive revenue versus profitability?
-→ Fan Shop dominates revenue, while Budget segments contribute disproportionately to profitability, revealing a volume–margin mismatch.
-
-3. Where are operational failures most concentrated?
-→ First Class shipping and Puerto Rico outbound routes account for the majority of late deliveries and delivery-time overruns.
-
-4. Which customer and payment combinations present the highest fraud risk?
-→ Fraud is highly concentrated in Consumer segments using transfer payments, indicating a process failure rather than broad-based risk.
-
-
-Supporting Analytical Definitions:
-To enable consistent and decision-ready analysis, several derived metrics and categorical definitions were implemented during the Bronze → Silver data preparation stage.
-
-1. Financial & Profitability Foundations
-- Established core financial metrics (gross sales, net revenue, discounts, and implicit total cost) to define a reliable profit-and-loss baseline at the order level.
-
-- Enabled identification of margin erosion, pricing inefficiencies, and loss-making (“profit bleeder”) orders that were not directly visible in the raw dataset.
-
-2. Operational & Efficiency Metrics
-- Derived unit-level cost, markup, margin leakage, and logistics delay indicators to uncover procurement drift, pricing power failures, and delivery inefficiencies.
-
-- Introduced delivery performance deltas and binary loss flags to isolate operational failures without relying on misleading averages.
-
-3. Strategic Segmentation & Classification
-- Created categorical groupings for delivery performance, price segments, order timing, and trade routes to translate raw transactional data into business-relevant segments.
-
-- These segments enabled focused analysis of portfolio strategy, supply chain bottlenecks, and risk concentration across regions and customer types.
-
-
-
----
-
-📂 Repository Structure
-
-/data_scaling: Google Colab notebooks used for SDV (CTGAN) training and synthetic data generation to scale the dataset beyond Excel-sized limits.
-
-/pipelines: Local Bronze → Silver and Silver → SQL processing scripts implementing idempotent, reproducible data preparation workflows.
-
-/sql: DDLs and analytical queries.
-
-/powerbi: The .pbix dashboard file.
-
-/docs: Additional reference material.
-
-
----
-
-⚙️ Tech Stack & Decisions
-
-Microsoft SQL Server: Used as the analytical warehouse for schema enforcement, PK/FK relationships, and SQL-driven analysis; dimensional shaping handled upstream.
-
-Power BI: Used for analytical consumption and storytelling; DAX measures organized in a dedicated "_key_measures" layer for KPIs and risk metrics.
-
-Python (Pandas / Polars): Used for raw data cleaning, normalization, and Bronze → Silver processing with idempotent and archival logic.
-
-SDV (CTGAN) + Google Colab: Used exclusively for synthetic data generation (~2M rows) to stress-test analytical logic beyond Excel-scale limits
-
-Note: Google Colab was used solely for SDV (CTGAN) training due to the absence of local GPU resources.
-
-
----
-
-⚠️ Limitations
-
-- Customer-level identifiers and personal attributes were intentionally excluded during synthetic data generation to ensure model stability and scalability, focusing the analysis on aggregate supply chain, operational, and financial behavior rather than individual customers.
-
-- Cost, profit, and logistics metrics are derived from available columns and represent analytical estimates rather than audited financial figures.
-
-- The workflow is designed for analytical correctness and reproducibility, not real-time processing or production-scale orchestration.
-
----
-
-Note:
-- Additional exploratory scripts were used during validation and experimentation
-  but are intentionally excluded to keep the repository focused and reproducible.
-
-- Trained model artifacts (.pkl) are intentionally excluded to keep the repository lightweight and reproducible.
+- **Data Lake:** MinIO (Local S3 Object Store), `s3fs`
+- **Data Engineering:** Python, Polars, Pandas
+- **Serving Layer:** Microsoft SQL Server (or SQLite in `TEST_MODE`), SQLAlchemy
+- **Analytics & BI:** Power BI, DAX
+- **Synthetic Data:** SDV (CTGAN), PyTorch
