@@ -8,11 +8,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def normalize_text_series(series: pl.Series) -> pl.Series:
     """Normalize accented or special Unicode characters to plain ASCII."""
-    # We apply this element-wise since unicodedata doesn't have a direct Polars native binding
-    return series.map_elements(
-        lambda x: ''.join(c for c in unicodedata.normalize('NFD', str(x)) if unicodedata.category(c) != 'Mn') if x is not None else "",
-        return_dtype=pl.String
-    )
+    # To truly fix the 'Seúl', 'Japón' issue, we need to make sure we encode and decode properly
+    def safe_ascii(val):
+        if val is None:
+            return ""
+        # 1. Normalize NFD (separates characters from their accents)
+        nfd_str = unicodedata.normalize('NFD', str(val))
+        # 2. Encode to ASCII ignoring errors (drops the detached accents), then decode back
+        return nfd_str.encode('ascii', 'ignore').decode('utf-8')
+
+    return series.map_elements(safe_ascii, return_dtype=pl.String)
 
 def standardize_columns(df: pl.DataFrame) -> pl.DataFrame:
     """Standardize column names to snake_case."""
@@ -39,6 +44,7 @@ def main():
     logging.info(f"Loading raw dataset from {args.input} (using cp1252 to handle broken latin-1 encoding)")
 
     try:
+        # Ignore errors to force reading past bad bytes if they exist
         df = pl.read_csv(args.input, encoding="cp1252", ignore_errors=True)
     except Exception as e:
         logging.error(f"Failed to read CSV: {e}")
@@ -86,20 +92,28 @@ def main():
             order_dayofweek=pl.date(pl.col("order_year"), pl.col("order_month"), pl.col("order_day")).dt.weekday()
         ).drop(["date_str_clean", "parsed_date"])
 
+    # Handle Missing Values in key columns before SDV
+    if "customer_zipcode" in df.columns:
+        df = df.with_columns(pl.col("customer_zipcode").fill_null(0.0)) # Assuming 0 for missing zip
+
     # 4. Drop Unused Columns
     logging.info("Pruning unused/sensitive columns...")
     cols_to_drop = [
         'customer_email', 'customer_fname', 'customer_lname', 'customer_password',
-        'customer_street', 'customer_zipcode', 'order_id', 'order_item_id',
+        'customer_street', 'order_id', 'order_item_id',
         'customer_id', 'order_customer_id', 'product_card_id',
         'order_item_cardprod_id', 'category_id', 'department_id',
         'product_category_id', 'product_description', 'product_image',
         'latitude', 'longitude', 'benefit_per_order', 'sales_per_customer',
         'delivery_status', 'late_delivery_risk', 'customer_city', 'order_city',
         'order_item_discount', 'sales', 'order_item_total', 'order_profit_per_order',
-        'order_zipcode', 'product_price', 'product_status',
+        'order_zipcode', 'product_status',
         'shipping_date_dateorders'
     ]
+
+    # Notice: I removed 'product_price' and 'customer_zipcode' from the drop list.
+    # SDV needs product_price to learn the FixedCombinations.
+
     existing_cols = [c for c in cols_to_drop if c in df.columns]
     df = df.drop(existing_cols)
 
