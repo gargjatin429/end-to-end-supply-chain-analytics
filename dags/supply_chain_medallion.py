@@ -11,7 +11,7 @@ sys.path.append('/opt/airflow')
 
 from pipelines.Project_Batch_Process import main as batch_process_main
 from pipelines.Project_Silver_To_SQL import main as sql_load_main
-from data_scaling.prep_raw_data import main as prep_raw_data_main
+
 
 default_args = {
     'owner': 'airflow',
