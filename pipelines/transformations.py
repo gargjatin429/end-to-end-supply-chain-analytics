@@ -1,12 +1,32 @@
 import polars as pl
-from config import DIM_GEO_PATH, DIM_CUST_PATH, DIM_PROD_PATH, get_s3_storage_options
+import logging
 
-def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Transforms raw Bronze data into curated Silver data.
-    """
-    storage_options = get_s3_storage_options()
+class DataValidationError(Exception):
+    """Exception raised for errors in the incoming data schema or validation."""
+    pass
 
+class IncompleteDimensionError(Exception):
+    """Exception raised when a join with a dimension table results in NULL keys."""
+    pass
+
+
+def _validate_schema(df: pl.DataFrame) -> pl.DataFrame:
+    required_columns = [
+        "order_year", "order_month", "order_day",
+        "order_item_product_price", "order_item_quantity",
+        "order_item_discount_rate", "order_item_profit_ratio",
+        "days_for_shipping_real", "days_for_shipment_scheduled",
+        "customer_country", "customer_state", "order_country", "order_state",
+        "order_region", "market", "product_name", "category_name", "department_name"
+    ]
+
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise DataValidationError(f"Missing required columns in Bronze data: {missing_columns}")
+
+    return df
+
+def _parse_dates(df: pl.DataFrame) -> pl.DataFrame:
     df = (
         df
         .with_columns(
@@ -24,12 +44,13 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
 
     df = df.unique(maintain_order=True)
 
-    df = df.drop([
-        "order_dayofweek",
-        "valid_date_check",
-        "shipping_mode"
-    ])
+    columns_to_drop = ["order_dayofweek", "valid_date_check", "shipping_mode"]
+    existing_cols_to_drop = [col for col in columns_to_drop if col in df.columns]
+    df = df.drop(existing_cols_to_drop)
 
+    return df
+
+def _calculate_financials(df: pl.DataFrame) -> pl.DataFrame:
     df = (
         df
         .with_columns([
@@ -80,7 +101,9 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
             ).fill_nan(0.0).alias("margin_leakage_pct")
         ])
     )
+    return df
 
+def _apply_business_rules(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns([
         pl.when(pl.col("shipping_delta") < 0).then(pl.lit("Early"))
           .when(pl.col("shipping_delta") == 0).then(pl.lit("On Time"))
@@ -147,26 +170,61 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
               .alias("state_density_class")
         ])
     )
+    return df
 
-    dim_geo = pl.read_parquet(DIM_GEO_PATH, storage_options=storage_options)
-    dim_cust = pl.read_parquet(DIM_CUST_PATH, storage_options=storage_options)
-    dim_prod = pl.read_parquet(DIM_PROD_PATH, storage_options=storage_options)
-
+def _join_dimensions(df: pl.DataFrame, dim_geo: pl.DataFrame, dim_cust: pl.DataFrame, dim_prod: pl.DataFrame) -> pl.DataFrame:
     df = (
         df
         .join(dim_geo,
               on=["order_state", "order_country", "order_region", "market"],
               how="left")
-        .drop(["order_state", "order_country", "order_region", "market"])
         .join(dim_cust,
               on=["customer_state", "customer_country"],
               how="left")
-        .drop(["customer_state", "customer_country"])
         .join(dim_prod,
               on=["product_name", "category_name", "department_name"],
               how="left")
-        .drop(["product_name", "category_name", "department_name"])
     )
+
+    # Validation checks for missing dimensions
+    if "geo_id" in df.columns and df.filter(pl.col("geo_id").is_null()).height > 0:
+        missing = df.filter(pl.col("geo_id").is_null()).select(["order_state", "order_country"]).unique().to_dicts()
+        logging.error(f"Missing geo dimensions: {missing}")
+        raise IncompleteDimensionError("Join with dim_geo resulted in NULL keys.")
+
+    if "customer_geo_id" in df.columns and df.filter(pl.col("customer_geo_id").is_null()).height > 0:
+        missing = df.filter(pl.col("customer_geo_id").is_null()).select(["customer_state", "customer_country"]).unique().to_dicts()
+        logging.error(f"Missing customer geo dimensions: {missing}")
+        raise IncompleteDimensionError("Join with dim_cust resulted in NULL keys.")
+
+    if "product_key" in df.columns and df.filter(pl.col("product_key").is_null()).height > 0:
+        missing = df.filter(pl.col("product_key").is_null()).select(["product_name", "category_name"]).unique().to_dicts()
+        logging.error(f"Missing product dimensions: {missing}")
+        raise IncompleteDimensionError("Join with dim_prod resulted in NULL keys.")
+
+    # Drop join keys
+    df = df.drop([
+        "order_state", "order_country", "order_region", "market",
+        "customer_state", "customer_country",
+        "product_name", "category_name", "department_name"
+    ])
+
+    return df
+
+def transform_bronze_to_silver(
+    df: pl.DataFrame,
+    dim_geo: pl.DataFrame,
+    dim_cust: pl.DataFrame,
+    dim_prod: pl.DataFrame
+) -> pl.DataFrame:
+    """
+    Transforms raw Bronze data into curated Silver data.
+    """
+    df = _validate_schema(df)
+    df = _parse_dates(df)
+    df = _calculate_financials(df)
+    df = _apply_business_rules(df)
+    df = _join_dimensions(df, dim_geo, dim_cust, dim_prod)
 
     df = df.sort(
         ["order_year", "order_month", "order_day", "order_item_quantity"]

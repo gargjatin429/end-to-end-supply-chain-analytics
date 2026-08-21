@@ -5,10 +5,11 @@ import logging
 from sqlalchemy import create_engine
 from datetime import datetime
 import sys
+from urllib.parse import urlparse
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import SILVER_DIR, ARCHIVE_DIR, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY
+from config import SILVER_DIR, ARCHIVE_DIR, SQL_SERVER_NAME, SQL_DATABASE, SQL_DRIVER, get_s3_storage_options, S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, TEST_MODE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -30,18 +31,25 @@ STRICT_COLUMNS = [
     "state_order_count", "state_density_class"
 ]
 
+def get_s3_path(uri: str) -> str:
+    """Safely extract the path component from an S3 URI."""
+    parsed = urlparse(uri)
+    return f"{parsed.netloc}{parsed.path}"
+
 def main():
     logging.info("Starting Silver → SQL fact load pipeline.")
 
-    fs = s3fs.S3FileSystem(
-        key=S3_ACCESS_KEY,
-        secret=S3_SECRET_KEY,
-        client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
-    )
+    try:
+        fs = s3fs.S3FileSystem(
+            key=S3_ACCESS_KEY,
+            secret=S3_SECRET_KEY,
+            client_kwargs={'endpoint_url': S3_ENDPOINT_URL}
+        )
+    except Exception as e:
+        logging.critical(f"Failed to initialize S3 File System: {e}")
+        sys.exit(1)
 
-    is_testing = os.getenv("TEST_MODE", "false").lower() == "true"
-
-    if is_testing:
+    if TEST_MODE:
         db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_analytics.db")
         connection_string = f"sqlite:///{db_path}"
         logging.info(f"Running in test mode. Using SQLite at {db_path}")
@@ -52,7 +60,7 @@ def main():
         )
 
     try:
-        if is_testing:
+        if TEST_MODE:
             engine = create_engine(connection_string)
         else:
             engine = create_engine(connection_string, fast_executemany=True)
@@ -61,13 +69,13 @@ def main():
             pass
         logging.info("Connected to database.")
     except Exception as e:
-        logging.error(f"Connection failed: {e}")
-        return
+        logging.critical(f"Database connection failed: {e}")
+        sys.exit(1)
 
-    silver_path_no_scheme = SILVER_DIR.replace("s3://", "")
-    parquet_files = fs.glob(f"{silver_path_no_scheme}/Fact_*.parquet")
+    silver_path = get_s3_path(SILVER_DIR)
+    parquet_files = fs.glob(f"{silver_path}/Fact_*.parquet")
 
-    single_file = f"{silver_path_no_scheme}/DataCo_Silver.parquet"
+    single_file = f"{silver_path}/DataCo_Silver.parquet"
     if fs.exists(single_file) and single_file not in parquet_files:
         parquet_files.append(single_file)
 
@@ -94,13 +102,14 @@ def main():
             df_clean = df.select(available_columns)
             logging.info(f"Loading {df_clean.height} rows into SQL.")
 
-            df_clean.to_pandas().to_sql(
-                name=TABLE_NAME,
-                con=engine,
-                if_exists="append",
-                index=False,
-                chunksize=10_000
-            )
+            # ATOMIC TRANSACTION BLOCK using Polars write_database with sqlalchemy
+            with engine.begin() as connection:
+                df_clean.write_database(
+                    table_name=TABLE_NAME,
+                    connection=connection,
+                    if_table_exists="append",
+                    engine="sqlalchemy"
+                )
 
             logging.info("Load successful.")
 
@@ -108,13 +117,16 @@ def main():
             archive_name = f"LOADED_{file_name}_{timestamp}.parquet"
             archive_path = f"{ARCHIVE_DIR}/{archive_name}"
 
-            fs.copy(file_path, archive_path.replace("s3://", ""))
+            # Safely move file
+            fs.copy(file_path, get_s3_path(archive_path))
             fs.rm(file_path)
             logging.info(f"Archived file as: {archive_path}")
 
         except Exception as e:
-            logging.error(f"Error loading {file_name}: {e}", exc_info=True)
-            logging.info("Skipping file.")
+            # For DB loading, almost any error implies a system state issue (DB full, connection dropped, etc.)
+            logging.critical(f"System or Data error loading {file_name}: {e}", exc_info=True)
+            logging.info("Aborting SQL load batch to prevent partial state.")
+            sys.exit(1)
 
     logging.info("Silver → SQL pipeline completed.")
 
