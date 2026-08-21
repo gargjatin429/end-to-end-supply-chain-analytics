@@ -11,7 +11,7 @@ def normalize_text_series(series: pl.Series) -> pl.Series:
     # To truly fix the 'Seúl', 'Japón' issue, we need to make sure we encode and decode properly
     def safe_ascii(val):
         if val is None:
-            return ""
+            return None
         # 1. Normalize NFD (separates characters from their accents)
         nfd_str = unicodedata.normalize('NFD', str(val))
         # 2. Encode to ASCII ignoring errors (drops the detached accents), then decode back
@@ -48,6 +48,12 @@ def main():
         df = pl.read_csv(args.input, encoding="cp1252", ignore_errors=True)
     except Exception as e:
         logging.error(f"Failed to read CSV: {e}")
+        return
+
+
+    # 0. Core Schema Validation Check
+    if "order date (DateOrders)" not in df.columns:
+        logging.error("CRITICAL: Missing 'order date (DateOrders)' column. This file does not match expected Kaggle schema.")
         return
 
     # 1. Standardize Columns first to make downstream references easy

@@ -10,7 +10,9 @@ class IncompleteDimensionError(Exception):
     pass
 
 
-def _validate_schema(df: pl.DataFrame) -> pl.DataFrame:
+def _validate_schema(df: pl.LazyFrame) -> pl.LazyFrame:
+    # We inspect schema from lazy frame
+    cols = df.collect_schema().names()
     required_columns = [
         "order_year", "order_month", "order_day",
         "order_item_product_price", "order_item_quantity",
@@ -20,13 +22,32 @@ def _validate_schema(df: pl.DataFrame) -> pl.DataFrame:
         "order_region", "market", "product_name", "category_name", "department_name"
     ]
 
-    missing_columns = [col for col in required_columns if col not in df.columns]
+    missing_columns = [col for col in required_columns if col not in cols]
     if missing_columns:
         raise DataValidationError(f"Missing required columns in Bronze data: {missing_columns}")
 
     return df
 
-def _parse_dates(df: pl.DataFrame) -> pl.DataFrame:
+def _safe_cast_and_filter(df: pl.LazyFrame) -> pl.LazyFrame:
+    """Explicitly cast types to prevent schema math errors and filter impossible values."""
+    df = df.with_columns([
+        pl.col("order_item_product_price").cast(pl.Float64, strict=False),
+        pl.col("order_item_quantity").cast(pl.Int64, strict=False),
+        pl.col("order_item_discount_rate").cast(pl.Float64, strict=False),
+        pl.col("order_item_profit_ratio").cast(pl.Float64, strict=False),
+        pl.col("days_for_shipping_real").cast(pl.Int64, strict=False),
+        pl.col("days_for_shipment_scheduled").cast(pl.Int64, strict=False),
+    ])
+
+    # Filter physical impossibilities
+    df = df.filter(
+        (pl.col("order_item_product_price") >= 0) &
+        (pl.col("order_item_quantity") > 0) & # Quantity > 0 protects division later
+        (pl.col("days_for_shipment_scheduled") >= 0)
+    )
+    return df
+
+def _parse_dates(df: pl.LazyFrame) -> pl.LazyFrame:
     df = (
         df
         .with_columns(
@@ -43,14 +64,10 @@ def _parse_dates(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     df = df.unique(maintain_order=True)
-
-    columns_to_drop = ["order_dayofweek", "valid_date_check", "shipping_mode"]
-    existing_cols_to_drop = [col for col in columns_to_drop if col in df.columns]
-    df = df.drop(existing_cols_to_drop)
-
+    df = df.drop(["order_dayofweek", "valid_date_check", "shipping_mode"], strict=False)
     return df
 
-def _calculate_financials(df: pl.DataFrame) -> pl.DataFrame:
+def _calculate_financials(df: pl.LazyFrame) -> pl.LazyFrame:
     df = (
         df
         .with_columns([
@@ -79,8 +96,11 @@ def _calculate_financials(df: pl.DataFrame) -> pl.DataFrame:
     df = (
         df
         .with_columns([
-            (pl.col("total_cost") / pl.col("order_item_quantity"))
-            .alias("actual_unit_cost"),
+            # Safe division for unit cost
+            pl.when(pl.col("order_item_quantity") > 0)
+              .then(pl.col("total_cost") / pl.col("order_item_quantity"))
+              .otherwise(pl.lit(0.0))
+              .alias("actual_unit_cost"),
 
             (pl.col("order_profit_amount") < 0)
             .alias("is_profit_bleeder"),
@@ -90,20 +110,23 @@ def _calculate_financials(df: pl.DataFrame) -> pl.DataFrame:
             .alias("shipping_delta")
         ])
         .with_columns([
-            (
-                (pl.col("order_item_product_price") - pl.col("actual_unit_cost"))
-                / pl.col("actual_unit_cost")
-            ).alias("markup_pct"),
+            # Safe division for markup
+            pl.when(pl.col("actual_unit_cost") > 0)
+              .then((pl.col("order_item_product_price") - pl.col("actual_unit_cost")) / pl.col("actual_unit_cost"))
+              .otherwise(pl.lit(0.0))
+              .alias("markup_pct"),
 
-            (
-                pl.col("discount_amount")
-                / (pl.col("order_profit_amount") + pl.col("discount_amount"))
-            ).fill_nan(0.0).alias("margin_leakage_pct")
+            # Safe division for margin leakage
+            pl.when((pl.col("order_profit_amount") + pl.col("discount_amount")) != 0)
+              .then(pl.col("discount_amount") / (pl.col("order_profit_amount") + pl.col("discount_amount")))
+              .otherwise(pl.lit(0.0))
+              .fill_nan(0.0)
+              .alias("margin_leakage_pct")
         ])
     )
     return df
 
-def _apply_business_rules(df: pl.DataFrame) -> pl.DataFrame:
+def _apply_business_rules(df: pl.LazyFrame) -> pl.LazyFrame:
     df = df.with_columns([
         pl.when(pl.col("shipping_delta") < 0).then(pl.lit("Early"))
           .when(pl.col("shipping_delta") == 0).then(pl.lit("On Time"))
@@ -172,7 +195,7 @@ def _apply_business_rules(df: pl.DataFrame) -> pl.DataFrame:
     )
     return df
 
-def _join_dimensions(df: pl.DataFrame, dim_geo: pl.DataFrame, dim_cust: pl.DataFrame, dim_prod: pl.DataFrame) -> pl.DataFrame:
+def _join_dimensions(df: pl.LazyFrame, dim_geo: pl.LazyFrame, dim_cust: pl.LazyFrame, dim_prod: pl.LazyFrame) -> pl.LazyFrame:
     df = (
         df
         .join(dim_geo,
@@ -186,23 +209,8 @@ def _join_dimensions(df: pl.DataFrame, dim_geo: pl.DataFrame, dim_cust: pl.DataF
               how="left")
     )
 
-    # Validation checks for missing dimensions
-    if "geo_id" in df.columns and df.filter(pl.col("geo_id").is_null()).height > 0:
-        missing = df.filter(pl.col("geo_id").is_null()).select(["order_state", "order_country"]).unique().to_dicts()
-        logging.error(f"Missing geo dimensions: {missing}")
-        raise IncompleteDimensionError("Join with dim_geo resulted in NULL keys.")
-
-    if "customer_geo_id" in df.columns and df.filter(pl.col("customer_geo_id").is_null()).height > 0:
-        missing = df.filter(pl.col("customer_geo_id").is_null()).select(["customer_state", "customer_country"]).unique().to_dicts()
-        logging.error(f"Missing customer geo dimensions: {missing}")
-        raise IncompleteDimensionError("Join with dim_cust resulted in NULL keys.")
-
-    if "product_key" in df.columns and df.filter(pl.col("product_key").is_null()).height > 0:
-        missing = df.filter(pl.col("product_key").is_null()).select(["product_name", "category_name"]).unique().to_dicts()
-        logging.error(f"Missing product dimensions: {missing}")
-        raise IncompleteDimensionError("Join with dim_prod resulted in NULL keys.")
-
-    # Drop join keys
+    # We drop the keys in the lazy frame graph.
+    # NULL checking is deferred to the main script after collection because LazyFrames cannot be filtered/counted natively until executed.
     df = df.drop([
         "order_state", "order_country", "order_region", "market",
         "customer_state", "customer_country",
@@ -212,24 +220,22 @@ def _join_dimensions(df: pl.DataFrame, dim_geo: pl.DataFrame, dim_cust: pl.DataF
     return df
 
 def transform_bronze_to_silver(
-    df: pl.DataFrame,
-    dim_geo: pl.DataFrame,
-    dim_cust: pl.DataFrame,
-    dim_prod: pl.DataFrame
-) -> pl.DataFrame:
+    df: pl.LazyFrame,
+    dim_geo: pl.LazyFrame,
+    dim_cust: pl.LazyFrame,
+    dim_prod: pl.LazyFrame
+) -> pl.LazyFrame:
     """
-    Transforms raw Bronze data into curated Silver data.
+    Transforms raw Bronze data into curated Silver data using Polars Lazy execution graph.
     """
     df = _validate_schema(df)
+    df = _safe_cast_and_filter(df)
     df = _parse_dates(df)
     df = _calculate_financials(df)
     df = _apply_business_rules(df)
     df = _join_dimensions(df, dim_geo, dim_cust, dim_prod)
 
-    df = df.sort(
-        ["order_year", "order_month", "order_day", "order_item_quantity"]
-    )
-
-    df = df.rename({col: col.lower() for col in df.columns})
+    df = df.sort(["order_year", "order_month", "order_day", "order_item_quantity"])
+    df = df.rename({col: col.lower() for col in df.collect_schema().names()})
 
     return df

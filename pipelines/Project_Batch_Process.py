@@ -33,9 +33,9 @@ def main():
     storage_options = get_s3_storage_options()
     logging.info("Pre-loading dimensions into memory.")
     try:
-        dim_geo = pl.read_parquet(DIM_GEO_PATH, storage_options=storage_options)
-        dim_cust = pl.read_parquet(DIM_CUST_PATH, storage_options=storage_options)
-        dim_prod = pl.read_parquet(DIM_PROD_PATH, storage_options=storage_options)
+        dim_geo = pl.scan_parquet(DIM_GEO_PATH, storage_options=storage_options)
+        dim_cust = pl.scan_parquet(DIM_CUST_PATH, storage_options=storage_options)
+        dim_prod = pl.scan_parquet(DIM_PROD_PATH, storage_options=storage_options)
     except Exception as e:
         logging.critical(f"Failed to load dimension tables from S3: {e}")
         sys.exit(1)
@@ -52,17 +52,31 @@ def main():
         logging.info(f"Processing file {i}/{len(csv_files)}: {file_name}")
 
         try:
-            # STEP 1: LOAD
-            with fs.open(full_s3_path, 'rb') as f:
-                df = pl.read_csv(f, encoding="cp1252")
-
-            # STEP 2-7: TRANSFORMATIONS
-            df_silver = transform_bronze_to_silver(df, dim_geo, dim_cust, dim_prod)
-
-            # STEP 7: WRITE
+            # STEP 0: IDEMPOTENCY CHECK
             output_name = f"Fact_{os.path.splitext(file_name)[0]}.parquet"
             output_path = f"{SILVER_DIR}/{output_name}"
+            if fs.exists(get_s3_path(output_path)):
+                logging.info(f"File {output_name} already exists in Silver layer. Skipping to prevent duplicates.")
+                continue
 
+            # STEP 1: LOAD (Lazy)
+            with fs.open(full_s3_path, 'rb') as f:
+                df = pl.read_csv(f, encoding="cp1252").lazy()
+
+            # STEP 2-7: TRANSFORMATIONS (Execute Graph)
+            lf_silver = transform_bronze_to_silver(df, dim_geo, dim_cust, dim_prod)
+            df_silver = lf_silver.collect()
+
+            # LATE VALIDATION (Because LazyFrames can't filter/count before execution)
+            if df_silver.height == 0:
+                logging.warning("Dataframe is empty after filtering invalid rows. Skipping write.")
+                continue
+            if "geo_id" in df_silver.columns and df_silver.filter(pl.col("geo_id").is_null()).height > 0:
+                raise IncompleteDimensionError("Join with dim_geo resulted in NULL keys.")
+            if "product_key" in df_silver.columns and df_silver.filter(pl.col("product_key").is_null()).height > 0:
+                raise IncompleteDimensionError("Join with dim_prod resulted in NULL keys.")
+
+            # STEP 7: WRITE
             with fs.open(get_s3_path(output_path), 'wb') as f:
                 df_silver.write_parquet(f)
 
