@@ -54,9 +54,12 @@ def main():
         connection_string = f"sqlite:///{db_path}"
         logging.info(f"Running in test mode. Using SQLite at {db_path}")
     else:
+        # Use SQL Auth because Linux containers cannot do Windows Auth natively
+        sql_user = os.getenv("SQL_USER", "sa")
+        sql_pass = os.getenv("SQL_PASSWORD", "Password123!")
         connection_string = (
-            f"mssql+pyodbc://@{SQL_SERVER_NAME}/{SQL_DATABASE}"
-            f"?driver={SQL_DRIVER}&trusted_connection=yes"
+            f"mssql+pyodbc://{sql_user}:{sql_pass}@{SQL_SERVER_NAME}/{SQL_DATABASE}"
+            f"?driver={SQL_DRIVER}"
         )
 
     try:
