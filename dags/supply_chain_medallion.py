@@ -26,7 +26,7 @@ with DAG(
     'supply_chain_medallion_pipeline',
     default_args=default_args,
     description='End-to-end analytical data engineering workflow',
-    schedule_interval=None, # Triggered manually
+    schedule=None, # Triggered manually
     start_date=datetime(2023, 1, 1),
     catchup=False,
     tags=['medallion', 'supply_chain'],
